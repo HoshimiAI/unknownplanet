@@ -1,0 +1,20 @@
+{
+  "name": "@unknown-planet/sdk",
+  "version": "0.1.0",
+  "description": "Developer-facing client for Unknown Planet.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "tsc --build --clean tsconfig.build.json",
+    "dev": "tsc --project tsconfig.build.json --watch",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "test": "bun test index.test.js",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": { "@unknown-planet/core": "workspace:*" }
+}

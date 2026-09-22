@@ -1,0 +1,24 @@
+{
+  "name": "@unknown-planet/elysia",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "clean": "tsc --build --clean tsconfig.json",
+    "dev": "bun --watch src/index.ts",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "start": "bun src/index.ts",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@unknown-planet/core": "workspace:*",
+    "@unknown-planet/postgres": "workspace:*",
+    "@unknown-planet/sdk": "workspace:*",
+    "elysia": "^1.4.25",
+    "pg": "^8.16.3"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.5"
+  }
+}
