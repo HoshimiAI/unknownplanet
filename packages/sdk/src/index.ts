@@ -8,7 +8,7 @@ export { startHttpRequest } from "./observability/telemetry.js";
 
 export type {
   DocumentIngestInput, DocumentIngestResult, EntityResolutionConfig, GraphSearchInput, GraphSearchResult,
-  PlanetConfig, PlanetQueryInput, PlanetQueryResult, ProviderSelectionInput, ProviderSelector, RetrievalConfig,
+  PlanetConfig, PlanetQueryInput, PlanetQueryResult, PlanetQueryRanker, ProviderSelectionInput, ProviderSelector, RetrievalConfig,
 } from "./types.js";
 
 export type {

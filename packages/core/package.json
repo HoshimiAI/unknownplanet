@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "description": "Storage-neutral domain model and adapter contracts for Unknown Planet.",
   "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/HoshimiAI/unknownplanet.git", "directory": "packages/core" },
+  "publishConfig": { "access": "public" },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

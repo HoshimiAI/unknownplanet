@@ -25,6 +25,8 @@ export interface RetrievalConfig {
   ranker?: (input: { query: string; results: GraphSearchResult[] }) => GraphSearchResult[] | Promise<GraphSearchResult[]>;
 }
 
+export type PlanetQueryRanker = (input: { query: string; results: PlanetQueryResult[] }) => PlanetQueryResult[] | Promise<PlanetQueryResult[]>;
+
 export interface EntityResolutionConfig { fuzzyThreshold?: number; embeddingThreshold?: number }
 
 export interface PlanetConfig {
@@ -56,6 +58,8 @@ export interface PlanetConfig {
   documentParsers?: Record<string, DocumentParser>;
   entityResolution?: EntityResolutionConfig;
   retrieval?: RetrievalConfig;
+  /** Optional application policy applied to fused results before the result limit. */
+  queryRanker?: PlanetQueryRanker;
 }
 
 export interface GraphSearchInput {

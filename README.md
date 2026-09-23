@@ -9,6 +9,8 @@ An AI-native data-layer orchestrator for graph, vector, document, and evidence r
 - `@unknown-planet/mongodb` — MongoDB graph/document/evidence adapters and Atlas Vector Search.
 - `@unknown-planet/sdk` — the `Planet` client and deterministic hybrid retrieval pipeline.
 
+Core contracts are grouped by domain in `packages/core/src/contracts`. The SDK keeps the public `Planet` facade in `packages/sdk/src/client/planet.ts`; graph search and hybrid query live beside it, while document and memory workflows live in `packages/sdk/src/client/ingestion`. Framework-specific integrations can depend on these package entry points without importing internal files.
+
 ## Commands
 
 ```sh
@@ -18,6 +20,16 @@ bun run typecheck
 bun run lint
 bun run test
 ```
+
+## Install in another repository
+
+After a release is published to the public npm registry, packages can be installed directly without linking this checkout. For Lunar's PostgreSQL storage provider, install its peer dependencies and the Planet packages:
+
+```sh
+bun add @unknown-planet/sdk @unknown-planet/postgres @unknown-planet/core
+```
+
+Use `@unknown-planet/mongodb` instead of `@unknown-planet/postgres` for the MongoDB adapter. Keep the packages on compatible releases; adapter packages depend on `@unknown-planet/core` using a semver range. The first release of a set must publish `core` before `sdk`, `postgres`, or `mongodb`.
 
 ## Live Elysia smoke test
 
@@ -113,6 +125,17 @@ const answer = await scoped.query({ text: "Does attention improve forecasting?",
 
 Memory writes are idempotent when the caller supplies a stable `id` or `source` identity. They are embedded and indexed, optionally passed through the configured entity extractor, linked to resolved graph entities, and attached to source-aware evidence. The query fuses keyword, vector, graph, and indexed document-chunk results and returns source references. Cross-provider operations are not transactional: retry failed writes using the same source identity.
 
+Framework adapters that own their memory lifecycle can use `memory.persist()` for scoped CRUD storage without invoking Planet's embedding, vector, or graph ingestion pipeline. `memory.add()` remains the higher-level knowledge ingestion path:
+
+```ts
+const frameworkMemory = await scoped.memory.persist({
+  id: "framework-memory-42",
+  agentId: "research-agent",
+  content: "Attention improved forecasting performance",
+  source: { type: "framework-session", id: "thread-42" },
+})
+```
+
 SDK page methods return `{ items, nextCursor }`; pass `nextCursor` as `cursor` on the next request. They order results by stable record IDs for predictable continuation. The HTTP API exposes matching `/page` routes for memory, document chunks, graph search, hybrid query, evidence, and identity bindings.
 
 Use `OpenAICompatibleEmbeddingProvider` and `JsonHttpEntityExtractor` from `@unknown-planet/sdk`; both can target hosted or OpenAI-compatible local HTTP services. PDF parsing requires a supplied `DocumentParser`; built-in parsing supports plain text, Markdown, HTML, and JSON. Chunk size and overlap are configurable in `planet.document.ingest`.
@@ -188,7 +211,7 @@ const planet = new Planet({
   routing: { sql: "postgres" },
 })
 
-const project = await planet.sql.query<{ id: string; name: string }>({
+const project = await planet.sql.execute<{ id: string; name: string }>({
   text: "INSERT INTO projects (id, name) VALUES ($1, $2) RETURNING id, name",
   values: [crypto.randomUUID(), "Unknown Planet"],
 })
@@ -202,7 +225,7 @@ const memberships = await planet.sql.query<{ project_name: string; user_email: s
 })
 ```
 
-`planet.sql` is available only when the routed provider implements `SqlStore`; MongoDB providers intentionally do not expose SQL.
+`planet.sql.query()` uses the `read` route; `planet.sql.execute()` uses the `write` route. This lets a `routingPolicy` send reads to a replica and writes to a primary. A fixed `routing.sql` entry takes precedence for both. `planet.sql` is available only when the selected provider implements `SqlStore`; MongoDB providers intentionally do not expose SQL.
 
 `planet.sql.transaction()` is available when the routed provider supports transactions (the PostgreSQL provider does). The callback receives a parameterized transaction client:
 
@@ -243,9 +266,9 @@ const cache = planet.extension(cacheExtension)
 
 ## Lunar ADK custom provider
 
-Lunar ADK integrates through a Lunar-owned custom provider package, not a dependency from Planet core. The provider consumes a configured `Planet` instance and implements Lunar's `StorageBundle` and `MemoryProvider` contracts using PostgreSQL SQL transactions and Planet vectors.
+Lunar ADK integrates through a Lunar-owned custom provider package. The provider consumes a configured `Planet` instance and currently implements Lunar's `StorageBundle` contract using PostgreSQL SQL transactions.
 
-The integration requires a PostgreSQL-routed `planet.sql` capability because Lunar run/session persistence relies on atomic transactions. It stores Lunar runs, sessions, workflows, and memories in a dedicated `lunar` schema; source graph/document data stays in the existing Planet domains.
+The integration requires a PostgreSQL-routed `planet.sql` capability because Lunar run/session persistence relies on atomic transactions. It stores Lunar runs, sessions, and workflows in a dedicated `lunar` schema; source graph/document data stays in the existing Planet domains. Lunar memory integration is the next package milestone.
 
 The provider's additive migration and its rollback guidance are documented in [Lunar ADK provider notes](docs/lunar-adk-provider.md). Cache and artifacts remain Lunar-owned future providers: a Lunar cache provider can consume a typed Planet extension without either core framework changing.
 
@@ -267,3 +290,5 @@ const searchPlanet = new Planet({
   },
 })
 ```
+
+`retrieval.ranker` customizes semantic graph search. `queryRanker` receives the complete fused `planet.query()` result set after filters and can apply application scoring before the result limit. `queryPage()` continues to order by stable IDs for cursor pagination.

@@ -3,6 +3,8 @@
   "version": "0.1.0",
   "description": "PostgreSQL and pgvector adapters for Unknown Planet.",
   "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/HoshimiAI/unknownplanet.git", "directory": "packages/postgres" },
+  "publishConfig": { "access": "public" },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -24,7 +26,7 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
-    "@unknown-planet/core": "workspace:*",
+    "@unknown-planet/core": "^0.1.0",
     "pg": "^8.16.3"
   },
   "devDependencies": {
