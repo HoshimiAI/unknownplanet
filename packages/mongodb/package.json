@@ -13,6 +13,7 @@
     "clean": "tsc --build --clean tsconfig.build.json",
     "dev": "tsc --project tsconfig.build.json --watch",
     "lint": "tsc --project tsconfig.json --noEmit",
+    "test": "bun test test",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "dependencies": { "@unknown-planet/core": "workspace:*", "mongodb": "^6.18.0" }

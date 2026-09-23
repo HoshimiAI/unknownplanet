@@ -10,11 +10,30 @@ services:
     volumes:
       - unknownplanet-postgres:/var/lib/postgresql/data
       - ./packages/postgres/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      - ./packages/postgres/migrations/002_production_core.sql:/docker-entrypoint-initdb.d/002_production_core.sql:ro
+      - ./packages/postgres/migrations/003_identity_catalog.sql:/docker-entrypoint-initdb.d/003_identity_catalog.sql:ro
+      - ./packages/postgres/migrations/004_memory_sources.sql:/docker-entrypoint-initdb.d/004_memory_sources.sql:ro
+      - ./packages/postgres/migrations/005_entity_merge_history.sql:/docker-entrypoint-initdb.d/005_entity_merge_history.sql:ro
+      - ./packages/postgres/migrations/006_merge_snapshots.sql:/docker-entrypoint-initdb.d/006_merge_snapshots.sql:ro
+      - ./packages/postgres/migrations/007_ingestion_jobs.sql:/docker-entrypoint-initdb.d/007_ingestion_jobs.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U unknownplanet -d unknownplanet"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  mongodb:
+    image: mongo:7
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - unknownplanet-mongodb:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "try { rs.status().ok } catch (e) { rs.initiate({_id:'rs0',members:[{_id:0,host:'localhost:27017'}]}).ok }"]
       interval: 5s
       timeout: 5s
       retries: 20
 
 volumes:
   unknownplanet-postgres:
+  unknownplanet-mongodb:

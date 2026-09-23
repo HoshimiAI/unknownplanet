@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { PostgresSqlStore } from "./dist/index.js";
+import { PostgresSqlStore } from "../dist/index.js";
 
 test("commits a callback through a pooled PostgreSQL connection", async () => {
   const statements = [];

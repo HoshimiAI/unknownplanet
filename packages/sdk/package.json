@@ -6,15 +6,23 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": ["dist"],
   "scripts": {
     "build": "tsc --project tsconfig.build.json",
     "clean": "tsc --build --clean tsconfig.build.json",
     "dev": "tsc --project tsconfig.build.json --watch",
     "lint": "tsc --project tsconfig.json --noEmit",
-    "test": "bun test index.test.js",
+    "test": "bun test test",
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
-  "dependencies": { "@unknown-planet/core": "workspace:*" }
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@unknown-planet/core": "workspace:*"
+  }
 }

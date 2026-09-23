@@ -17,7 +17,8 @@
       "dependsOn": ["^build"]
     },
     "test": {
-      "dependsOn": ["^build"]
+      "dependsOn": ["^build"],
+      "env": ["UP_TEST_DATABASE_URL", "UP_TEST_MONGODB_URI"]
     },
     "typecheck": {
       "dependsOn": ["^build"]

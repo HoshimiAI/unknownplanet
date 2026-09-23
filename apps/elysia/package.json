@@ -12,7 +12,8 @@
     "typecheck": "tsc --project tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@unknown-planet/core": "workspace:*",
+    "@opentelemetry/api": "^1.9.1",
+    "@opentelemetry/sdk-node": "^0.222.0",
     "@unknown-planet/postgres": "workspace:*",
     "@unknown-planet/sdk": "workspace:*",
     "elysia": "^1.4.25",
