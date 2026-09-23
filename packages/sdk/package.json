@@ -1,6 +1,6 @@
 {
   "name": "@unknown-planet/sdk",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Developer-facing client for Unknown Planet.",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/HoshimiAI/unknownplanet.git", "directory": "packages/sdk" },
@@ -25,6 +25,6 @@
   },
   "dependencies": {
     "@opentelemetry/api": "^1.9.1",
-    "@unknown-planet/core": "^0.1.0"
+    "@unknown-planet/core": "^1.0.0"
   }
 }
