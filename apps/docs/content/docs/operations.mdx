@@ -1,0 +1,55 @@
+---
+title: Operations
+description: Environment, migrations, authentication, and telemetry configuration.
+---
+
+## Environment
+
+The Elysia app reads environment variables at startup:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | Local Compose PostgreSQL URL | PostgreSQL connection. |
+| `PORT` | `3000` | HTTP listen port. |
+| `TENANT_ID` | `local-dev` | Default development tenant. |
+| `WORKSPACE_ID` | Empty | Optional default workspace. |
+| `PLANET_SCHEMA` | `public` | Schema for Planet tables and SQL search path. |
+| `EMBEDDING_DIMENSIONS` | `8` | Demo/API vector dimension. |
+| `OPENAI_API_KEY` | Empty | Enables the OpenAI-compatible embedding provider. |
+| `OPENAI_BASE_URL` | OpenAI API base URL | Optional compatible endpoint. |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model name. |
+| `LLM_API_KEY`, `LLM_API_URL`, `LLM_MODEL` | Empty | Optional entity extractor configuration; required in production. |
+| `API_KEYS` | Empty | JSON map from bearer tokens to tenant/workspace scopes. |
+| `OTEL_ENABLED` | `false` | Enables telemetry SDK initialization. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Empty | OTLP collector base URL. |
+| `OTEL_SERVICE_NAME` | `unknown-planet-elysia` | Telemetry resource name. |
+
+`NODE_ENV=production` requires API keys, an OpenAI embedding key, and all three LLM extractor settings. The application should use authenticated scope data; do not expose the development default tenant as a production authorization mechanism.
+
+## Migrations
+
+For local development, Compose mounts the ordered PostgreSQL SQL migrations into the database initialization directory. For an existing database, configure `DATABASE_URL` and run:
+
+```sh
+bun run --cwd packages/postgres migrate
+```
+
+Set `PLANET_SCHEMA` consistently for the migration command and `createPostgresProvider`. PostgreSQL vector search requires pgvector. MongoDB requires a replica set for transactions; Atlas Vector Search also requires an index configured in Atlas.
+
+## Authentication and isolation
+
+When `API_KEYS` is unset, the sample API uses `TENANT_ID` and optional `WORKSPACE_ID` for every request. Configure `API_KEYS` as a JSON object mapping bearer tokens to scope objects to enable bearer authentication, for example:
+
+```sh
+API_KEYS='{"replace-with-secret":{"tenantId":"tenant-a","workspaceId":"workspace-a"}}'
+```
+
+Use secret management in deployed environments. The SDK expects the application to derive scopes from verified authentication context.
+
+## Telemetry
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` or the standard traces/metrics endpoint variables to export telemetry over OTLP/HTTP. Set `OTEL_SDK_DISABLED=true` to disable SDK initialization. Instrumentation covers HTTP requests, SDK operations and stages, embedding/extraction calls, storage adapter calls, and PostgreSQL query duration/errors. Prompts, SQL text and parameters, credentials, and tenant IDs are not recorded.
+
+## Local database lifecycle
+
+Compose persists database data in named volumes. Migration files mounted into `/docker-entrypoint-initdb.d` run only when a new data directory is initialized. Recreating that volume deletes its local database contents; for an existing volume, apply migrations with the migration command instead.

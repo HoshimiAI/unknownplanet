@@ -1,0 +1,51 @@
+---
+title: Identity catalog use cases
+description: Give names stable IDs across providers and link external resources.
+---
+
+Use the identity catalog when names vary across sources or when a record in one provider needs a stable application identity. An identity is scoped and namespaced, independent of the underlying resource IDs.
+
+## Create, resolve, and alias
+
+```ts
+const identity = await planet.nameId.create({
+  namespace: 'customer',
+  name: 'Northwind Traders',
+  metadata: { tier: 'enterprise' },
+});
+
+await planet.nameId.alias.add({
+  namespace: 'customer',
+  alias: 'Northwind',
+  identityId: identity.id,
+});
+
+const match = await planet.nameId.resolve({
+  namespace: 'customer',
+  name: 'Northwind',
+});
+```
+
+Identity resolution checks the canonical name and registered aliases. Namespaces prevent unrelated domains from colliding (for example, a `person` and a `product` both named “Mercury”). Alias normalization and fuzzy matching depend on provider capabilities.
+
+## Bind cross-provider resources
+
+```ts
+await planet.nameId.bind({
+  identityId: identity.id,
+  providerId: 'crm',
+  resourceType: 'account',
+  resourceId: 'acct-918',
+  metadata: { source: 'salesforce' },
+});
+
+const bindings = await planet.nameId.bindings.list({ identityId: identity.id });
+```
+
+Bindings map a stable identity to resource IDs owned by providers. Use them for CRM/ERP reconciliation, external IDs, and provider migrations. Unknown Planet does not fetch or synchronize the referenced resource automatically.
+
+## Entity ingestion integration
+
+When an entity extractor is configured, document and memory ingestion attempt to resolve extracted entities in the `entity:<type>` namespace, create identities where supported, and register aliases. Identity support therefore improves entity deduplication across ingestion runs. Fuzzy identity matching is configurable with `entityResolution.fuzzyThreshold`; embedding similarity threshold is also configurable where relevant.
+
+The sample HTTP API exposes create, resolve, alias, and binding operations. It does not expose every SDK list operation.

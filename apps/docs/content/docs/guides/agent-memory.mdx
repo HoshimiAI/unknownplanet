@@ -1,0 +1,62 @@
+---
+title: Agent memory use cases
+description: Choose between raw persistence and full semantic memory ingestion.
+---
+
+Memory records are useful for user preferences, episodic events, decisions, instructions, and summaries that an agent may need in later turns. Records can be scoped to an agent and optionally to a user or session. The SDK types include `fact`, `observation`, `episode`, `decision`, `preference`, `instruction`, and `summary`.
+
+## Full memory ingestion
+
+Use `memory.add` when Planet should make the memory searchable semantically and connect extracted entities to graph knowledge:
+
+```ts
+const memory = await planet.memory.add({
+  agentId: 'support-assistant',
+  userId: 'user-42',
+  sessionId: 'session-2026-09-25',
+  type: 'preference',
+  content: 'Prefers concise answers with an example.',
+  importance: 0.8,
+  confidence: 1,
+  source: { type: 'conversation', id: 'turn-18' },
+  metadata: { language: 'en' },
+});
+```
+
+This path needs an embedding provider, MemoryStore, VectorStore, and GraphStore. It embeds the content, stores it in the `memory` vector namespace and node namespace, creates/updates a memory graph node, and may link extracted entities. Evidence is attached to the generated mention relationships when an EvidenceStore is available. Durable ingestion jobs are used when `ingestionJobs` is routed.
+
+## Store framework-owned memories
+
+Use `memory.persist` when another framework already manages embeddings/graph work, or when the application only needs a Planet memory record:
+
+```ts
+const record = await planet.memory.persist({
+  agentId: 'support-assistant',
+  userId: 'user-42',
+  content: 'The customer approved the revised schedule.',
+  type: 'episode',
+  source: { type: 'ticket', id: 'ticket-884' },
+});
+```
+
+`persist` writes directly through MemoryStore and does not create vectors or graph nodes. It still validates required agent/content and score bounds. The memory delete workflow assumes graph/vector integration; for raw persisted records, use the configured store's deletion path or ensure corresponding graph and vector adapters/records exist before calling `planet.memory.delete`.
+
+## Retrieve safely
+
+```ts
+const relevant = await planet.memory.search({
+  agentId: 'support-assistant',
+  userId: 'user-42',
+  query: 'How should I format answers?',
+  type: 'preference',
+  limit: 10,
+});
+```
+
+Memory search uses lexical results and adds semantic results when embeddings and vector routing are available. It filters candidates by agent/user/session/type and metadata. Use all applicable owner filters; do not rely on natural-language text to enforce user isolation. Scope is applied separately through the Planet client.
+
+`get`, `searchPage`, and `delete` support lifecycle management. Cursor pagination requires a MemoryStore that implements `searchPage`.
+
+## HTTP API
+
+The sample service exposes `POST /v1/memory`, `GET /v1/memory`, `GET /v1/memory/page`, `GET /v1/memory/{id}`, and `DELETE /v1/memory/{id}`. It exposes full `add`, not the SDK-only `persist` distinction. Writes return a durable `jobId` in failure responses when ingestion fails.

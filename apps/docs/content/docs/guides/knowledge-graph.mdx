@@ -1,0 +1,58 @@
+---
+title: Knowledge graph use cases
+description: Model connected facts, navigate relationships, and merge duplicate entities.
+---
+
+Use the graph when the relationships between records matter: product dependencies, people and organizations, service ownership, scientific claims, or events over time. Nodes have a type, name, JSON properties, and optional embedding. Edges connect node IDs and can carry relation labels, confidence, properties, status, and valid-time bounds.
+
+## Create connected records
+
+```ts
+const person = await planet.graph.node.create({
+  type: 'person',
+  name: 'Ari Chen',
+  properties: { department: 'research' },
+});
+const project = await planet.graph.node.create({
+  type: 'project',
+  name: 'Forecasting',
+});
+const edge = await planet.graph.edge.create({
+  from: person.id,
+  to: project.id,
+  relation: 'WORKS_ON',
+  confidence: 0.95,
+  status: 'canonical',
+  validFrom: new Date('2026-01-01T00:00:00Z'),
+});
+```
+
+Use stable application IDs when records must be reconciled across imports. IDs are provider-neutral strings. Node properties are suitable for attributes needed with the node; represent queryable relationships as edges.
+
+## Navigate and search
+
+`planet.graph.traverse({ startIds, depth, direction, relation, limit, asOf })` follows graph edges. The core GraphStore contract also defines a direct neighbors operation for adapter users; the Planet facade currently exposes traversal rather than a `planet.graph.neighbors` method. Text search uses the GraphStore's keyword implementation. Semantic graph search requires both an embedding provider and vector store:
+
+```ts
+const matches = await planet.graph.search({
+  query: 'teams responsible for forecasting',
+  semantic: true,
+  limit: 10,
+  graph: { depth: 2 },
+  asOf: new Date(),
+});
+```
+
+Semantic search first finds vector candidates in the configured node namespace (default `node`), expands through graph edges, then sorts by score with stable name/ID tie-breaks. Expanded node scores decay with hop depth (default factor `0.8`). Use `candidateLimit`, `defaultGraphDepth`, `graphDecay`, or a custom retrieval ranker to tune this behavior.
+
+## Merge duplicates
+
+When an adapter implements `mergeNodes`, `planet.graph.node.merge({ sourceId, targetId })` redirects the source's relationships to the canonical target, removes the duplicate, and stores a merge audit record transactionally. PostgreSQL supports transactional graph merges. Check adapter capability before relying on merge history in a portable integration.
+
+## Time-aware facts
+
+Edges can specify `validFrom` and `validTo`; search and traversal can use `asOf` to consider a point in time. This is useful for employment, ownership, policy, or system topology that changes. Keep event time in edge validity fields and ingestion time in record timestamps; they represent different questions.
+
+## HTTP API
+
+The sample API provides `POST /v1/nodes`, `POST /v1/edges`, `POST /v1/nodes/{nodeId}/merge`, `POST /v1/graph/search`, and `POST /v1/graph/search/page`. Node creation accepts an optional embedding, which must match `EMBEDDING_DIMENSIONS` and is also upserted into the node vector namespace.

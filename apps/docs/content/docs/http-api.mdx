@@ -1,0 +1,49 @@
+---
+title: HTTP API
+description: Use the versioned Elysia API and its request conventions.
+---
+
+The example service in `apps/elysia` exposes its API under `/v1`. It serves `/v1/openapi.json` and `/v1/health`. JSON request bodies use camelCase SDK field names. Responses are scoped to the server's configured tenant or the bearer token's tenant when `API_KEYS` is set.
+
+## Routes
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/health` | Check SQL connectivity. |
+| `POST` | `/nodes`, `/edges`, `/nodes/{nodeId}/merge` | Create graph records and merge nodes. |
+| `POST` | `/vectors` | Upsert a vector. |
+| `POST` | `/graph/search`, `/graph/search/page` | Search the graph. |
+| `POST` | `/memory`; `GET` | Add and search memories. |
+| `GET` | `/memory/{id}`, `/memory/page`; `DELETE` | Read, page, and delete memories. |
+| `POST` | `/query`, `/query/page` | Hybrid knowledge search. |
+| `POST` | `/documents`, `/documents/{documentId}/chunks` | Create documents and chunks. |
+| `GET` | `/documents/{documentId}/chunks`, `/documents/{documentId}/chunks/page` | List chunks. |
+| `POST` | `/ingest` | Start document ingestion and return a job. |
+| `GET` | `/ingestion-jobs/{id}`; `POST /ingestion-jobs/run-due` | Read or process ingestion jobs. |
+| `POST` | `/evidence`; `GET /evidence/{edgeId}` | Add and list edge evidence. |
+| `POST` | `/identities`, `/identities/aliases`; `GET /identities/resolve` | Create, alias, and resolve identities. |
+| `POST` | `/identities/{identityId}/bindings`; `GET` | Bind resources and list bindings. |
+
+The API also has page routes for graph search, query results, evidence, and identity bindings. See the live OpenAPI document for request schemas.
+
+## Error responses
+
+Errors are JSON with `error`, `code`, and `requestId`. Common codes include `unauthorized`, `invalid_request`, `not_found`, `conflict`, `capability_unavailable`, and `internal_error`. A failed ingestion request can include a `jobId` for checking its durable state.
+
+## Example: memory
+
+```sh
+curl -X POST http://localhost:3000/v1/memory \
+  -H 'content-type: application/json' \
+  -d '{"agentId":"assistant","userId":"user-42","content":"Prefers concise summaries","type":"preference","importance":0.8}'
+
+curl 'http://localhost:3000/v1/memory?agentId=assistant&userId=user-42&text=summaries'
+```
+
+## Example: hybrid query
+
+```sh
+curl -X POST http://localhost:3000/v1/query \
+  -H 'content-type: application/json' \
+  -d '{"text":"What improved forecasting?","search":{"keyword":true,"vector":true,"graph":true},"includeEvidence":true,"limit":10}'
+```

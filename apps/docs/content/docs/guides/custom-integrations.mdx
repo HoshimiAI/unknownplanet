@@ -1,0 +1,89 @@
+---
+title: Custom integrations and advanced patterns
+description: Extend Planet with routing policies, SQL, blobs, parsers, and adapters.
+---
+
+## Add a provider at runtime
+
+`withProviders` creates a new client with additional adapters; `withRouting` creates one with a different static capability map. Provider IDs must remain unique. Explicit routes take precedence over routing policies and default selectors.
+
+```ts
+const searchClient = planet.withProviders([qdrantProvider], {
+  ...routing,
+  vector: 'qdrant',
+});
+```
+
+Use `selectProvider` when a default provider should be chosen based on capability and registered providers. Use `routingPolicy` when selection depends on operation and scope, such as directing writes to a primary and reads to a replica. These callbacks select a provider ID; they do not implement health checks or failover by themselves.
+
+## Add typed extensions
+
+Extensions let provider packages expose application-specific services without changing core contracts:
+
+```ts
+import { definePlanetExtension } from '@unknown-planet/sdk';
+
+interface CacheAdapter {
+  get(key: string): Promise<unknown>;
+  set(key: string, value: unknown): Promise<void>;
+}
+
+export const cacheExtension = definePlanetExtension<CacheAdapter>('cache');
+
+const cache = planet.extension(cacheExtension);
+await cache.set('node:42', { id: '42' });
+```
+
+Register the implementation on a provider's `extensions` record. Route keys with `routing.extensions`; alternatively pass a provider ID to `planet.extension(extension, providerId)` to select explicitly.
+
+## Run safe SQL
+
+SQL is for application tables or operations that need relational transactions. Prefer domain APIs for Planet-managed graph, vector, memory, document, evidence, and identity data. Parameterize every user-controlled value:
+
+```ts
+const result = await planet.sql.query<{ id: string }>({
+  text: 'SELECT id FROM app_audit WHERE actor_id = $1 ORDER BY created_at DESC LIMIT $2',
+  values: [actorId, 50],
+});
+
+await planet.sql.transaction(async (transaction) => {
+  await transaction.query({
+    text: 'INSERT INTO app_audit (id, actor_id, action) VALUES ($1, $2, $3)',
+    values: [crypto.randomUUID(), actorId, 'knowledge-reviewed'],
+  });
+});
+```
+
+`query` is the read path and `execute` is the write path. Transactions are optional at the contract level; the PostgreSQL provider implements them. SQL parameterization prevents value injection, but table/column authorization and tenant filtering remain application responsibilities.
+
+## Store source bytes in blob storage
+
+The built-in database providers do not implement blob storage. Supply a `BlobStorageAdapter` for S3-compatible storage or another object store, route `blobs` to it, and save the returned URI on the document:
+
+```ts
+const { uri } = await planet.blob.put({
+  key: `tenant/${scope.tenantId}/report.pdf`,
+  data: pdfBytes,
+  contentType: 'application/pdf',
+});
+
+const document = await planet.document.create({
+  title: 'Quarterly report',
+  contentUri: uri,
+  externalId: 'report-q3',
+});
+```
+
+The SDK does not automatically fetch bytes from a content URI. `document.ingest` takes bytes directly; the application is responsible for authorization and retrieval before ingestion or display.
+
+## Register custom parsers
+
+Pass `documentParsers` keyed by MIME type in `PlanetConfig` for formats beyond built-in plain text, Markdown, and HTML handling. A parser converts `{ data, contentType }` to text. Keep extraction isolated from chunking, and consider page/section boundaries when your file format supplies them.
+
+## Tune ranking and retrieval
+
+`retrieval.ranker` can filter or reorder semantic graph-search matches. `queryRanker` receives fused query results after built-in filters and before the limit. Candidate count, graph depth, decay, and node vector namespace are configurable. Tune these against a representative query set; increasing candidate limits or graph depth can improve recall at added storage/query cost.
+
+## Observe production behavior
+
+Enable OTLP telemetry for request traces and SDK/provider spans. Embedding and extractor adapters report model token usage when the upstream response supplies it. Use application-owned request IDs and content provenance to diagnose user-facing retrieval without placing prompts, credentials, SQL, or tenant IDs in telemetry.

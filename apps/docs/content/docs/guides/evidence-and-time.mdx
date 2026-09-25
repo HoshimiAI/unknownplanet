@@ -1,0 +1,39 @@
+---
+title: Evidence, provenance, and time
+description: Preserve where facts came from and retrieve claims as of a time.
+---
+
+Use evidence when graph edges represent claims that need source attribution, confidence tracking, or review. An `Evidence` record can reference a document, source ID, or chunk; it records extractor, confidence, direction (`support`, `contradict`, or `neutral`), strength, metadata, and creation time.
+
+## Attach evidence to an existing edge
+
+```ts
+const evidence = await planet.evidence.add({
+  edgeId: edge.id,
+  documentId: report.id,
+  sourceId: 'report-page-12',
+  chunkId: 'chunk-12',
+  sourceType: 'research-report',
+  extractor: 'human-review',
+  confidence: 0.92,
+  direction: 'support',
+  strength: 0.8,
+  metadata: { page: 12 },
+});
+```
+
+The SDK updates the linked edge confidence/status for non-neutral evidence. Supporting evidence increases confidence; contradicting evidence reduces it. The adapter stores evidence separately, and `planet.evidence.list` retrieves by edge, edge IDs, document, or source ID.
+
+## Preserve provenance through ingestion
+
+Document extraction creates candidate `MENTIONS` edges and attaches evidence when an EvidenceStore is routed. Memory ingestion does the same for extracted entities, using the memory source fields when present. This lets applications trace a graph assertion back to its source record and extracted entity.
+
+## Temporal queries
+
+Use edge `validFrom`/`validTo` for the interval during which a fact is true, and `createdAt` for when the system recorded it. Pass `asOf` to graph or hybrid search to retrieve facts valid at a chosen time. This is useful for historical ownership, staffing, policy, and system configuration questions.
+
+## Review workflows
+
+Treat `candidate`, `canonical`, `disputed`, `rejected`, and `deprecated` as application lifecycle signals. Evidence addition can change confidence and status, but the application still owns approval policy and human review. Store reviewer/action details in evidence metadata or an application audit system where needed.
+
+The sample API provides `POST /v1/evidence`, `GET /v1/evidence/{edgeId}`, and a paginated evidence route. Its list route is edge-oriented; use the SDK for the broader store filters.

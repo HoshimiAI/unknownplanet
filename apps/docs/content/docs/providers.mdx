@@ -1,0 +1,43 @@
+---
+title: Providers
+description: Configure PostgreSQL, MongoDB, and application-defined storage providers.
+---
+
+## PostgreSQL and pgvector
+
+Install `@unknown-planet/postgres` and its `pg` peer dependency. `createPostgresProvider` creates stores for graph, vectors, documents, chunks, evidence, memories, ingestion jobs, identities, and SQL. Its vector collections can declare expected dimensions and model names.
+
+```ts
+import { Pool } from 'pg';
+import { createPostgresProvider } from '@unknown-planet/postgres';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const postgres = createPostgresProvider({
+  database: pool,
+  schema: process.env.PLANET_SCHEMA ?? 'public',
+  vectorCollections: { node: { dimensions: 1536, model: 'text-embedding-3-small' } },
+});
+```
+
+The database needs the pgvector extension and the ordered migrations under `packages/postgres/migrations`. Set the same schema for migration and provider configuration.
+
+## MongoDB and Atlas Vector Search
+
+`@unknown-planet/mongodb` provides graph, vector, document, chunk, evidence, memory, and ingestion job stores. MongoDB transactions require a replica set. Call `initializeMongoIndexes(database)` during startup. Atlas Vector Search index creation remains an Atlas configuration step; a local MongoDB instance does not by itself supply that managed index.
+
+## Mix providers
+
+Each capability can route to a different provider. For example, use PostgreSQL for graph and memory, while a separately implemented provider supplies vectors. The provider ID in the routing map must match the ID registered on the provider. Ensure vector dimensions, model names, namespaces, and scope handling agree across the embedding provider and vector store.
+
+## Custom providers
+
+Implement the relevant contracts from `@unknown-planet/core` and register a `DataLayerProvider`. Store methods receive scope information where the contract supports it. A provider should enforce tenant isolation, validate inputs, and report unsupported operations clearly. The SDK wraps provider failures in `PlanetProviderError` with operation context.
+
+## Capability map
+
+| Capability | PostgreSQL | MongoDB | Additional setup |
+| --- | --- | --- | --- |
+| Graph, documents, chunks, evidence, memories, ingestion jobs | Yes | Yes | Run the corresponding migrations or initialize indexes. |
+| Vector search | pgvector | Atlas Vector Search | Enable pgvector or create the Atlas search index. |
+| Identities and SQL | Yes | No built-in implementation | Route to a compatible custom provider if needed. |
+| Blob storage | No | No | Supply an application-specific adapter. |

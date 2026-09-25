@@ -1,0 +1,47 @@
+---
+title: Vector search use cases
+description: Configure vector namespaces, model dimensions, and semantic retrieval.
+---
+
+Vector search fits fuzzy, conceptual, or natural-language matching: related documents, similar products, relevant memories, and semantically related graph entities. It does not replace keyword search for exact identifiers, codes, or short literal terms.
+
+## Store and search vectors directly
+
+```ts
+await planet.vector.upsert({
+  id: 'article-42',
+  namespace: 'article',
+  embedding: [0.12, -0.03, 0.71],
+  model: 'example-model',
+  metadata: { category: 'research' },
+});
+
+const matches = await planet.vector.search({
+  namespace: 'article',
+  embedding: [0.1, -0.02, 0.7],
+  model: 'example-model',
+  limit: 10,
+  metadata: { category: 'research' },
+});
+```
+
+Each namespace identifies a collection of comparable vectors. Keep dimensions and embedding model consistent within a namespace. Metadata filters use exact key/value matches at the SDK contract level; filtering support and index behavior depend on the backend adapter.
+
+## Choose an embedding provider
+
+The SDK requires an `EmbeddingProvider` with `embed({ text })`. It exports `OpenAICompatibleEmbeddingProvider`, which posts to an OpenAI-compatible `/embeddings` endpoint, validates numeric output, records reported input token usage, and retries transient failures. Configure `dimensions` only when the selected API supports it and make the returned vector length match the store configuration.
+
+The Elysia demo hash embedding is deterministic and dependency-free, useful for exercising vector persistence. It does not capture semantic similarity. For production use a model appropriate to the corpus and query language.
+
+## Backend considerations
+
+PostgreSQL uses pgvector distance search. The adapter can validate configured collection dimensions/model names; optional HNSW indexes can be created with `pgVectorCollectionIndexSql`. MongoDB delegates to Atlas Vector Search, so configure the Atlas search index and vector field mapping to match the adapter. Atlas Vector Search cannot be assumed available on a plain local MongoDB service.
+
+## Use vectors through higher-level features
+
+- `graph.search({ semantic: true })` embeds a query, finds node candidates, then optionally expands graph connections.
+- `memory.search({ query })` combines lexical memory search with vector candidates when embeddings and vector routing exist.
+- `document.ingest` stores chunk vectors in namespace `document-chunk` when an embedding provider is configured.
+- `planet.query` can search graph vectors and document chunk vectors, then fuse them with keyword results.
+
+All are scoped by the current Planet client. A missing vector route can make an otherwise configured workflow fail; verify the routing map includes `vector`.

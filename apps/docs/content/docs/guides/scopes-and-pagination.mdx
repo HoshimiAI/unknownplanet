@@ -1,0 +1,42 @@
+---
+title: Scopes, isolation, and pagination
+description: Design tenant-aware clients and paginate large result sets.
+---
+
+## Create a scoped client per request
+
+`PlanetScope` contains `tenantId` and optional `workspaceId`. Domain methods inject the configured scope into store calls. For a server, derive the scope from verified authentication and create a scoped client:
+
+```ts
+const requestPlanet = planet.withScope({
+  tenantId: authenticatedUser.tenantId,
+  workspaceId: authenticatedUser.workspaceId,
+});
+
+const docs = await requestPlanet.query({ text: 'current retention policy' });
+```
+
+Do not allow clients to choose arbitrary tenant IDs unless the application explicitly authorizes that access. Every custom provider must honor the passed scope. SQL calls are a separate concern: authorization and safe parameterization remain application responsibilities.
+
+The sample Elysia app maps bearer tokens from `API_KEYS` to scopes, or uses a single development scope from environment variables. Production startup requires API key configuration.
+
+## Cursor pagination
+
+Paginated SDK methods return `{ items, nextCursor }`; pass `nextCursor` to the next call until it is absent:
+
+```ts
+let cursor: string | undefined;
+do {
+  const page = await planet.memory.searchPage({ agentId: 'assistant', limit: 100, cursor });
+  await consume(page.items);
+  cursor = page.nextCursor;
+} while (cursor);
+```
+
+The SDK caps page limits (usually 500; memory search pages use the MemoryStore contract). Cursors are opaque; do not parse or construct them. A store must implement the relevant optional page method for native keyset pagination. Some facade page methods paginate a large fetched result set, so confirm the adapter behavior before using them for unbounded exports.
+
+Available SDK page methods include memory search, document chunk listing, graph search, query results, evidence lists, vector search, identity listing/bindings, and merge history. The sample HTTP API exposes selected `.../page` routes; inspect `/v1/openapi.json` for current schemas.
+
+## Tenant-safe vector operations
+
+Vector namespaces separate record categories, not tenants. Tenant isolation comes from the scope on every upsert/search/delete. Use namespace for semantic domain/model separation (such as `node`, `memory`, `document-chunk`, or application-specific collections), not as an authorization boundary.

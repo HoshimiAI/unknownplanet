@@ -1,0 +1,43 @@
+---
+title: Document ingestion use cases
+description: Turn source content into chunks, vectors, and optional graph knowledge.
+---
+
+Use document ingestion for reports, notes, policies, web pages, and other source material that should be searchable with provenance. Documents store metadata and a `contentUri`; chunks store text or a URI and offsets. Source bytes remain under application/blob-store ownership.
+
+## Supported parsing paths
+
+The built-in parser handles UTF-8 `text/plain`, Markdown (`text/markdown`, `text/x-markdown`), and `text/html`. Register a `DocumentParser` under the normalized MIME type for PDF, office formats, or other binary sources. For example, the parser should extract readable text; chunking and indexing remain Planet's responsibility.
+
+## Ingest a text document
+
+```ts
+const result = await planet.document.ingest({
+  title: 'Forecasting experiment notes',
+  contentType: 'text/markdown',
+  data: new TextEncoder().encode('# Results\nAttention improved accuracy.'),
+  contentUri: 's3://research/experiment-42.md',
+  externalId: 'experiment-42',
+  chunkSize: 1200,
+  overlap: 150,
+  metadata: { team: 'research' },
+});
+```
+
+Stable source identity comes from tenant/workspace plus `externalId`, `contentUri`, or content-derived identity. Reingesting the same source updates its deterministic document/chunk records and removes stale chunk vectors/chunks. Choose stable external IDs when source content can change.
+
+When embeddings are configured, chunks are embedded into `document-chunk`. When an entity extractor is configured, Planet creates a document node, entity nodes, `MENTIONS` edges, and evidence. Without an extractor it still parses, chunks, and (if embeddings exist) vector-indexes.
+
+## Chunk sizing
+
+Chunk size and overlap are measured in JavaScript string characters, not tokens. The chunker prefers a nearby whitespace boundary. Select sizes based on the embedding model and downstream context budget, then evaluate retrieval against representative queries. Excessive overlap increases storage and duplicate results; too little overlap can split a useful passage.
+
+## Durable jobs and retries
+
+When `ingestionJobs` is routed, ingestion records checkpoints, leases work, and can retry transient failures. Call `planet.ingestion.get(jobId)` for status and `planet.ingestion.runDue({ limit, leaseMs })` from a worker. Keep worker polling outside request handling for long-running corpora. Jobs track queued/processing/retry_wait/succeeded/failed states and checkpoints such as `parsed`, `chunks_saved`, `vectors_saved`, and `knowledge_saved`.
+
+## Manage and cite chunks
+
+Use `document.get`, `document.chunk.list`, `listPage`, `search`, and `deleteExcept` to inspect and manage stored content. Hybrid query results can include source document/chunk IDs, which applications can map to their own source access policy and citation URL. A content URI by itself does not guarantee that a caller is authorized to fetch the source bytes.
+
+The HTTP API offers `POST /v1/ingest`, job status and run-due routes, plus document and chunk creation/list routes. Direct API ingestion takes text content and encodes it as UTF-8; custom binary parsers are available through SDK configuration, not this sample endpoint.

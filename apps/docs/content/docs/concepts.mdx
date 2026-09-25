@@ -1,0 +1,49 @@
+---
+title: Core concepts
+description: How Planet routes capabilities across providers and scopes data.
+---
+
+## Planet client
+
+`Planet` is the SDK facade. It exposes graph, vector, memory, document, evidence, identity, ingestion, blob, SQL, and hybrid query APIs. It delegates operations to stores supplied through `PlanetConfig`.
+
+```ts
+import { Planet } from '@unknown-planet/sdk';
+import { createPostgresProvider } from '@unknown-planet/postgres';
+
+const provider = createPostgresProvider({ database: pool });
+const planet = new Planet({
+  providers: [provider],
+  routing: {
+    graph: 'postgres', vector: 'postgres', documents: 'postgres',
+    chunks: 'postgres', evidence: 'postgres', memories: 'postgres',
+    ingestionJobs: 'postgres', identities: 'postgres', sql: 'postgres',
+  },
+  scope: { tenantId: 'acme' },
+  embeddings,
+});
+```
+
+Only configure routes for capabilities present on the named provider. An unavailable capability raises a `PlanetCapabilityError` when used.
+
+## Providers and routing
+
+A `DataLayerProvider` has an `id` and can implement one or more contracts such as `graph`, `vector`, `memories`, or `blobs`. `ProviderRouting` maps each capability to a provider ID. This permits mixed backends, such as PostgreSQL for graph records and a dedicated vector service for embeddings.
+
+Provider routing is explicit. Registering a store does not automatically route a capability when the application supplies a routing map. Routing policies can select providers dynamically for each operation.
+
+## Scope and tenant isolation
+
+The SDK passes `PlanetScope` (`tenantId` and optional `workspaceId`) to scoped store calls. Create a request-specific client with `planet.withScope(...)` after authenticating the caller. The demo API accepts a single `TENANT_ID`/`WORKSPACE_ID`; when `API_KEYS` is configured, bearer tokens map to tenant scopes.
+
+Scope isolation depends on every configured provider enforcing the scope it receives. Do not trust tenant IDs supplied by an unauthenticated caller.
+
+## Embeddings
+
+`EmbeddingProvider` converts text to numeric vectors. Planet uses it for semantic search, document and memory ingestion, and entity matching. Vector collections can constrain dimensions and model names at provider configuration time. Keep the provider model and dimensions consistent for every vector in a namespace.
+
+The Elysia demo falls back to a deterministic character-hash embedding when `OPENAI_API_KEY` is absent. This validates storage flow but does not produce useful semantic embeddings. The SDK also exports `OpenAICompatibleEmbeddingProvider` for OpenAI-compatible endpoints.
+
+## Errors
+
+The SDK exports `PlanetError` and specialized capability, conflict, not-found, provider, and validation errors. The Elysia API maps errors to JSON containing an `error`, `code`, and `requestId`; ingestion failures may also include a `jobId`.
