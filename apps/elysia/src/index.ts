@@ -36,6 +36,7 @@ const planet = new Planet({
     documents: "postgres",
     chunks: "postgres",
     evidence: "postgres",
+    memories: "postgres",
     identities: "postgres",
     sql: "postgres",
   },
