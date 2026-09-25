@@ -1,0 +1,241 @@
+---
+title: Integrate Unknown Planet with Elysia
+description: Wire Planet into an Elysia API with scoped clients, routes, validation, and operations.
+---
+
+This guide describes how the repository's `apps/elysia` service composes Unknown Planet with Elysia. Use it as a reference when adding Planet capabilities to an existing Elysia application. The sample API is a Node/Bun server backed by PostgreSQL; it is not an Edge Runtime example.
+
+## 1. Install the packages
+
+Inside a Bun workspace, the example app depends on:
+
+```sh
+bun add elysia pg @types/pg @unknown-planet/sdk @unknown-planet/postgres @opentelemetry/api @opentelemetry/sdk-node
+```
+
+In this monorepo, those dependencies are already declared in `apps/elysia/package.json` and workspace packages use `workspace:*`. For a deployed app, install compatible published versions of `@unknown-planet/sdk` and the provider package. `pg` is the PostgreSQL driver used by this provider integration.
+
+## 2. Start PostgreSQL and apply migrations
+
+For local development from the repository root:
+
+```sh
+docker compose up -d postgres
+bun run --cwd packages/postgres migrate
+```
+
+The Compose PostgreSQL image includes pgvector. Compose applies the ordered migration files when it initializes a fresh volume; the migration command applies unapplied migrations to an existing database. Keep `PLANET_SCHEMA` aligned between migration and provider configuration. The database user needs permission to create/use pgvector and the Planet schema objects.
+
+## 3. Construct one shared provider-backed Planet client
+
+Create the connection pool and provider once at process startup. Reuse the provider adapters, then create a lightweight scoped Planet client per request.
+
+```ts
+import { Pool } from 'pg';
+import { createPostgresProvider } from '@unknown-planet/postgres';
+import {
+  OpenAICompatibleEmbeddingProvider,
+  Planet,
+} from '@unknown-planet/sdk';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const dimensions = Number(process.env.EMBEDDING_DIMENSIONS ?? 1536);
+const model = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small';
+
+const provider = createPostgresProvider({
+  database: pool,
+  schema: process.env.PLANET_SCHEMA ?? 'public',
+  vectorCollections: {
+    node: { dimensions, model },
+    memory: { dimensions, model },
+    'document-chunk': { dimensions, model },
+  },
+});
+
+const planet = new Planet({
+  providers: [provider],
+  routing: {
+    graph: 'postgres', vector: 'postgres', documents: 'postgres',
+    chunks: 'postgres', evidence: 'postgres', memories: 'postgres',
+    ingestionJobs: 'postgres', identities: 'postgres', sql: 'postgres',
+  },
+  scope: { tenantId: 'development' },
+  embeddings: new OpenAICompatibleEmbeddingProvider({
+    apiKey: process.env.OPENAI_API_KEY!,
+    model,
+    baseUrl: process.env.OPENAI_BASE_URL,
+    dimensions,
+  }),
+});
+```
+
+The constructor above illustrates production embedding configuration. Validate required environment variables before constructing it instead of relying on the non-null assertion in a real application. Add an `EntityExtractor` only if document or memory ingestion should extract named entities and create graph knowledge.
+
+### Vector dimensions must agree
+
+Every vector stored in a namespace must have the configured dimensions and model. The repository Elysia app defaults `EMBEDDING_DIMENSIONS` to `8` for its local demo embedding. When `OPENAI_API_KEY` is set, its current OpenAI-compatible provider construction does not pass the `dimensions` option, so the upstream model returns its default vector size. Set `EMBEDDING_DIMENSIONS` to that model's actual output size (for example, the default size for `text-embedding-3-small`) or update the application to pass a supported `dimensions` value to the embedding provider. The example above does the latter. Verify the upstream model configuration before writing production vectors; mismatches fail collection validation.
+
+Do not change models or dimensions for an existing namespace without re-embedding its records and updating its collection/index configuration. Treat that as a data migration.
+
+## 4. Resolve a trusted scope for each request
+
+Authentication should produce the scope; clients should not choose it. The sample app has two modes:
+
+- Development: use `TENANT_ID` and optional `WORKSPACE_ID` for every request.
+- API-key mode: set `API_KEYS` to a JSON object mapping bearer tokens to tenant/workspace scopes.
+
+Create the scoped client in Elysia's request derivation hook:
+
+```ts
+type AuthScope = { tenantId: string; workspaceId?: string };
+
+function clientForRequest(request: Request): Planet {
+  const scope = resolveVerifiedBearerScope(request);
+  if (!scope) throw Object.assign(new Error('Unauthorized'), { statusCode: 401 });
+  return planet.withScope(scope);
+}
+
+const app = new Elysia({ prefix: '/v1' })
+  .derive(({ request }) => ({ client: clientForRequest(request) }));
+```
+
+`resolveVerifiedBearerScope` represents application authentication: validate the credential (prefer constant-time comparison for shared secrets) and return only a verified scope. The real sample compares configured API keys with constant-time comparison and skips bearer checks only when `API_KEYS` is absent. Its startup guard refuses production mode without API keys. For an existing identity provider, validate its token and claims, then validate the resulting tenant/workspace scope before calling `withScope`.
+
+Every SDK operation uses the scope attached to that request client. All configured custom stores must enforce the passed scope. A `tenantId` is an isolation key, not proof of authorization.
+
+## 5. Add validated Elysia routes
+
+Expose domain operations through `client`; keep database details behind the provider. Elysia's `t` schemas validate request bodies before handler execution.
+
+```ts
+app.post('/memory', ({ body, client }) => client.memory.add({
+  agentId: body.agentId,
+  userId: body.userId,
+  sessionId: body.sessionId,
+  content: body.content,
+  type: body.type,
+  importance: body.importance,
+  confidence: body.confidence,
+  source: body.source,
+  metadata: body.metadata ?? {},
+}), {
+  body: t.Object({
+    agentId: t.String({ minLength: 1 }),
+    content: t.String({ minLength: 1 }),
+    userId: t.Optional(t.String()),
+    sessionId: t.Optional(t.String()),
+    type: t.Optional(t.Union([
+      t.Literal('fact'), t.Literal('observation'), t.Literal('episode'),
+      t.Literal('decision'), t.Literal('preference'),
+      t.Literal('instruction'), t.Literal('summary'),
+    ])),
+    importance: t.Optional(t.Number({ minimum: 0, maximum: 1 })),
+    confidence: t.Optional(t.Number({ minimum: 0, maximum: 1 })),
+    source: t.Optional(t.Object({ type: t.String(), id: t.String() })),
+    metadata: t.Optional(t.Record(t.String(), t.Any())),
+  }),
+});
+```
+
+`memory.add` needs an embedding provider, MemoryStore, VectorStore, and GraphStore. If the application owns a separate memory/embedding flow, SDK `memory.persist` stores a memory record without semantic vectors or graph ingestion; add a route for it deliberately rather than assuming `/memory` uses that lighter path.
+
+For other request-specific concerns:
+
+- Convert validated ISO timestamps to `Date` before passing `asOf`, `validFrom`, or `validTo` to SDK methods.
+- Validate embedding length at the HTTP boundary if accepting caller-provided vectors, then rely on the store's namespace/model validation as well.
+- Bound `limit`, graph depth, and payload size to match the application budget.
+- Do not forward arbitrary JSON directly into raw SQL; use the parameterized SQL API only for application-owned SQL workflows.
+
+## 6. Expose retrieval and source-aware results
+
+The sample route delegates query work to the SDK:
+
+```ts
+app.post('/query', ({ body, client }) => client.query({
+  text: body.text,
+  search: body.search,
+  filters: body.filters,
+  expand: body.expand,
+  includeEvidence: body.includeEvidence,
+  asOf: body.asOf ? parseIsoDate(body.asOf) : undefined,
+  limit: body.limit,
+}), {
+  body: t.Object({
+    text: t.String({ minLength: 1 }),
+    search: t.Optional(t.Object({
+      keyword: t.Optional(t.Boolean()),
+      vector: t.Optional(t.Boolean()),
+      graph: t.Optional(t.Boolean()),
+    })),
+    filters: t.Optional(t.Object({
+      nodeType: t.Optional(t.String()),
+      metadata: t.Optional(t.Record(t.String(), t.Any())),
+      agentId: t.Optional(t.String()),
+      documentId: t.Optional(t.String()),
+    })),
+    expand: t.Optional(t.Object({
+      relationDepth: t.Optional(t.Number({ minimum: 0, maximum: 8 })),
+    })),
+    includeEvidence: t.Optional(t.Boolean()),
+    limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })),
+    asOf: t.Optional(t.String()),
+  }),
+});
+```
+
+The real sample's `toDate` helper validates `asOf` and exposes the `filters` and `expand` fields shown above. Results can include graph nodes, edges, evidence, scores, and document source IDs. Before linking a returned `documentId`, `chunkId`, or `contentUri` to private source content, enforce the application's document-level authorization too.
+
+Use `client.graph.search` for graph-only search, `client.memory.search` for owner-filtered memories, and `client.document.ingest` for document ingestion. The sample API has dedicated routes for each; see [HTTP API](/docs/http-api) and `/v1/openapi.json` on a running service for the current route schemas.
+
+## 7. Handle errors consistently
+
+Install one `.onError` handler after request derivation. The sample maps `PlanetError.statusCode`, Elysia validation failures, and explicit status codes into an envelope:
+
+```json
+{
+  "error": "A readable message",
+  "code": "invalid_request",
+  "requestId": "request-id",
+  "jobId": "optional-ingestion-job-id"
+}
+```
+
+Common codes include `unauthorized`, `invalid_request`, `not_found`, `conflict`, `capability_unavailable`, and `internal_error`. Keep provider exception details out of public responses in production; the sample response includes the error message, so review that behavior against your disclosure policy before exposing it to untrusted clients. Keep a request ID in both the response and server logs for diagnosis.
+
+## 8. Move ingestion work to a worker
+
+For a small local service, a caller can trigger `/v1/ingestion-jobs/run-due`. In production, run due work in a dedicated worker process or scheduled worker loop:
+
+```ts
+const result = await workerPlanet.ingestion.runDue({ limit: 10, leaseMs: 60_000 });
+```
+
+`ingestionJobs` must be routed to a durable store. The repository app currently defines job status/worker routes but does not include `ingestionJobs: 'postgres'` in its routing map. Add that route before using those endpoints. Also apply migration `008_memory_ingestion_jobs.sql`; the current Compose initialization mounts migrations through `007`, so run the migration command against the database or add `008` to the Compose initialization list. Without this migration, the job table's original check constraint only permits document jobs. The store leases jobs so concurrent workers do not claim the same due item; expired leases can be recovered. Use job IDs to inspect state and retries. Do not block a short-lived HTTP request while a long document is parsed, embedded, or extracted; return a job identifier and let the client poll a status endpoint.
+
+## 9. Add request telemetry and graceful shutdown
+
+The sample starts an OpenTelemetry `NodeSDK` only when OTLP exporters or `OTEL_ENABLED=true` are configured. `onRequest` creates a request ID and span context; the derived scoped Planet client receives that parent context. Completion/error hooks finish the request span and log method, path, status, request ID, trace ID, and span ID.
+
+On `SIGINT`/`SIGTERM`, stop accepting requests and close the Elysia server, PostgreSQL pool, and telemetry SDK. If your app creates additional clients or workers, stop those as part of the same lifecycle. Avoid logging authorization headers, request bodies, tenant IDs, or SQL parameter values.
+
+## 10. Run locally and verify each capability
+
+From the repository root:
+
+```sh
+docker compose up -d postgres
+bun run --cwd packages/postgres migrate
+bun run --cwd apps/elysia dev
+```
+
+Then check SQL health and exercise one read/write path per capability you intend to rely on:
+
+```sh
+curl http://localhost:3000/v1/health
+curl -X POST http://localhost:3000/v1/memory \
+  -H 'content-type: application/json' \
+  -d '{"agentId":"demo","content":"The project uses scoped storage."}'
+curl 'http://localhost:3000/v1/memory?agentId=demo&text=scoped'
+```
+
+`/health` runs `SELECT 1`; it does not prove vector, memory, graph, or ingestion readiness. Run a representative write and search against the actual configured provider for every required capability. The deterministic local embedding verifies storage flow only, not semantic relevance. See [Operations](/docs/operations) for environment variables and [Providers](/docs/providers) for backend-specific requirements.
