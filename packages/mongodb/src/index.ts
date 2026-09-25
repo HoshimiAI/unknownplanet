@@ -5,6 +5,7 @@ import type {
   GraphNode, GraphStore, GraphTextSearchInput, GraphTraversal, JsonObject, MemoryRecord, MemorySearchInput, MemoryStore, NeighborsInput, NodeId, NodeMergeRecord, PlanetDocument,
   PlanetScope, TraverseInput, UpdateEdgeInput, UpdateIngestionJobInput, UpdateNodeInput, VectorRecord, VectorSearchInput, VectorSearchResult, VectorStore,
 } from "@unknown-planet/core";
+import { EmbeddingDimensionMismatchError } from "@unknown-planet/core";
 
 interface NodeDoc extends Document { _id: string; scopeId: string; type: string; name: string; properties: JsonObject; embedding?: number[]; createdAt: Date; updatedAt: Date }
 interface EdgeDoc extends Document { _id: string; scopeId: string; sourceId: string; targetId: string; relation: string; properties: JsonObject; confidence?: number; validFrom?: Date; validTo?: Date; status?: GraphEdge["status"]; createdAt: Date; updatedAt: Date }
@@ -175,7 +176,7 @@ export class MongoEvidenceStore implements EvidenceStore {
 export class MongoAtlasVectorStore implements VectorStore {
   private readonly vectors;
   constructor(db: Db, private readonly vectorIndex = "unknownplanet_vectors", private readonly collections: Readonly<Record<string, { dimensions: number; model?: string }>> = {}) { this.vectors = db.collection<VectorDoc>("vectors"); }
-  private validate(namespace: string, embedding: number[], model?: string) { if (!embedding.length || embedding.some((number) => !Number.isFinite(number))) throw new Error("An embedding must contain finite numbers."); const collection = this.collections[namespace]; if (collection && collection.dimensions !== embedding.length) throw new Error(`Vector namespace '${namespace}' requires ${collection.dimensions} dimensions.`); if (collection?.model && model && collection.model !== model) throw new Error(`Vector namespace '${namespace}' requires model '${collection.model}'.`); }
+  private validate(namespace: string, embedding: number[], model?: string) { if (!embedding.length || embedding.some((number) => !Number.isFinite(number))) throw new Error("An embedding must contain finite numbers."); const collection = this.collections[namespace]; if (collection && collection.dimensions !== embedding.length) throw new EmbeddingDimensionMismatchError(collection.dimensions, embedding.length, model ?? collection.model ?? "unspecified", namespace); if (collection?.model && model && collection.model !== model) throw new Error(`Embedding model mismatch. Expected: ${collection.model}; received: ${model}; collection: ${namespace}.`); }
   async upsert(input: VectorRecord): Promise<void> { this.validate(input.namespace, input.embedding, input.model); const currentScope = scopeId(input.scope); await this.vectors.updateOne({ _id: `${currentScope}:${input.namespace}:${input.id}` }, { $set: { id: input.id, scopeId: currentScope, namespace: input.namespace, model: input.model ?? this.collections[input.namespace]?.model, embedding: input.embedding, metadata: input.metadata ?? {}, updatedAt: new Date() }, $setOnInsert: { createdAt: new Date() } }, { upsert: true }); }
   async search(input: VectorSearchInput): Promise<VectorSearchResult[]> {
     if (input.namespace) this.validate(input.namespace, input.embedding, input.model);
@@ -270,7 +271,7 @@ export class MongoIngestionJobStore implements IngestionJobStore {
 }
 
 export function createMongoProvider(input: { id?: string; database: Db; vectorIndex?: string; vectorCollections?: Record<string, { dimensions: number; model?: string }> }): DataLayerProvider {
-  return { id: input.id ?? "mongodb", graph: new MongoGraphStore(input.database), documents: new MongoDocumentStore(input.database), chunks: new MongoDocumentChunkStore(input.database), evidence: new MongoEvidenceStore(input.database), memories: new MongoMemoryStore(input.database), ingestionJobs: new MongoIngestionJobStore(input.database), vector: new MongoAtlasVectorStore(input.database, input.vectorIndex, input.vectorCollections) };
+  return { id: input.id ?? "mongodb", graph: new MongoGraphStore(input.database), documents: new MongoDocumentStore(input.database), chunks: new MongoDocumentChunkStore(input.database), evidence: new MongoEvidenceStore(input.database), memories: new MongoMemoryStore(input.database), ingestionJobs: new MongoIngestionJobStore(input.database), vector: new MongoAtlasVectorStore(input.database, input.vectorIndex, input.vectorCollections), vectorCollections: input.vectorCollections };
 }
 
 /** Create the compound indexes used by the Mongo adapters. Atlas vector search index definitions remain managed by Atlas. */

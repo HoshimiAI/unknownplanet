@@ -1,5 +1,4 @@
 import type { EmbeddingProvider, Evidence, EvidenceStore, GraphStore, GraphTraversal, PlanetScope, ProviderOperation, VectorSearchResult, VectorStore } from "@unknown-planet/core";
-import { PlanetCapabilityError } from "../errors.js";
 import type { GraphSearchInput, GraphSearchResult, RetrievalConfig } from "../types.js";
 
 export interface GraphSearchContext {
@@ -9,7 +8,7 @@ export interface GraphSearchContext {
   requireGraph(operation: ProviderOperation): GraphStore;
   requireVector(operation: ProviderOperation): VectorStore;
   resolveEvidence(operation: ProviderOperation): EvidenceStore | undefined;
-  embed(text: string): Promise<number[]>;
+  embed(text: string, collection?: string): Promise<number[]>;
 }
 
 export async function searchGraph(input: GraphSearchInput, context: GraphSearchContext): Promise<GraphSearchResult[]> {
@@ -18,12 +17,11 @@ export async function searchGraph(input: GraphSearchInput, context: GraphSearchC
     const nodes = await context.requireGraph("search").searchNodes({ query: input.query, limit, scope: context.scope });
     return nodes.map((item) => ({ node: item, score: 1, evidence: [], edges: [] }));
   }
-  if (!context.embeddingProvider) throw new PlanetCapabilityError("EmbeddingProvider");
-  const embedding = await context.embed(input.query);
+  const embedding = await context.embed(input.query, input.vectorNamespace ?? context.retrieval.nodeNamespace ?? "node");
   const candidates = await context.requireVector("search").search({
     embedding,
     namespace: input.vectorNamespace ?? context.retrieval.nodeNamespace ?? "node",
-    model: context.embeddingProvider.model,
+    model: context.embeddingProvider?.model,
     limit: input.candidateLimit ?? context.retrieval.candidateLimit ?? Math.max(limit, limit * 2),
     scope: context.scope,
   });

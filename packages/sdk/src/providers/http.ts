@@ -5,7 +5,7 @@ export interface OpenAICompatibleEmbeddingConfig {
   apiKey: string;
   model: string;
   baseUrl?: string;
-  dimensions?: number;
+  dimensions: number;
   timeoutMs?: number;
   maxRetries?: number;
 }
@@ -34,17 +34,30 @@ async function postJson(url: string, apiKey: string, body: unknown, timeoutMs: n
 /** OpenAI API and OpenAI-compatible local gateways share this small embedding adapter. */
 export class OpenAICompatibleEmbeddingProvider implements EmbeddingProvider {
   readonly model: string;
+  readonly dimensions: number;
   constructor(private readonly config: OpenAICompatibleEmbeddingConfig) {
     if (!config.apiKey.trim() || !config.model.trim()) throw new Error("Embedding provider requires an API key and model.");
+    if (!Number.isInteger(config.dimensions) || !config.dimensions || config.dimensions < 1) throw new Error("Embedding provider requires a positive integer dimensions setting.");
     this.model = config.model;
+    this.dimensions = config.dimensions;
   }
   async embed(input: { text: string }): Promise<number[]> {
-    const response = await postJson(`${(this.config.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "")}/embeddings`, this.config.apiKey, { model: this.model, input: input.text, ...(this.config.dimensions ? { dimensions: this.config.dimensions } : {}) }, this.config.timeoutMs ?? 15000, this.config.maxRetries ?? 2) as { data?: Array<{ embedding?: number[] }>; usage?: { prompt_tokens?: number; total_tokens?: number } };
-    recordModelTokenUsage({ provider: "openai_compatible", model: this.model, inputTokens: response.usage?.prompt_tokens });
-    const vector = response.data?.[0]?.embedding;
-    if (!vector?.length || vector.some((value) => !Number.isFinite(value))) throw new Error("Embedding provider returned an invalid vector.");
-    if (this.config.dimensions && vector.length !== this.config.dimensions) throw new Error(`Embedding provider returned ${vector.length} dimensions; expected ${this.config.dimensions}.`);
+    const [vector] = await this.embedMany([input.text]);
+    if (!vector) throw new Error("Embedding endpoint returned no vectors.");
     return vector;
+  }
+  async embedMany(inputs: string[]): Promise<number[][]> {
+    if (inputs.length === 0) return [];
+    const response = await postJson(`${(this.config.baseUrl ?? "https://api.openai.com/v1").replace(/\/$/, "")}/embeddings`, this.config.apiKey, { model: this.model, input: inputs.length === 1 ? inputs[0] : inputs, dimensions: this.dimensions }, this.config.timeoutMs ?? 15000, this.config.maxRetries ?? 2) as { data?: Array<{ index?: number; embedding?: number[] }>; usage?: { prompt_tokens?: number; total_tokens?: number } };
+    recordModelTokenUsage({ provider: "openai_compatible", model: this.model, inputTokens: response.usage?.prompt_tokens ?? response.usage?.total_tokens });
+    if (!Array.isArray(response.data) || response.data.length !== inputs.length) throw new Error(`Embedding endpoint returned ${response.data?.length ?? 0} vectors for ${inputs.length} inputs.`);
+    return response.data.map((item, index) => ({ index: item.index ?? index, embedding: item.embedding }))
+      .sort((left, right) => left.index - right.index)
+      .map(({ embedding }) => {
+        if (!embedding?.length || embedding.some((value) => !Number.isFinite(value))) throw new Error("Embedding provider returned an invalid vector.");
+        if (embedding.length !== this.dimensions) throw new Error(`Embedding dimension mismatch. Expected: ${this.dimensions}; received: ${embedding.length}; model: ${this.model}.`);
+        return embedding;
+      });
   }
 }
 

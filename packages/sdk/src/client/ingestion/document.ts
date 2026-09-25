@@ -45,12 +45,13 @@ export async function ingestDocumentCore(input: DocumentIngestInput, context: Kn
   });
   await checkpoint?.("chunks_saved");
   await withSpan("planet.ingestion.embed_and_index", { "unknownplanet.chunk.count": chunks.length }, async () => {
-    if (context.embeddingProvider) for (let index = 0; index < chunks.length; index += 1) {
+    if (context.embeddingProvider && chunks.length > 0) {
+      const vectors = await context.embedMany(chunks.map((chunk) => chunk.text ?? ""), "document-chunk");
+      for (let index = 0; index < chunks.length; index += 1) {
       const chunk = chunks[index]!;
-      const body = chunk.text ?? "";
-      const embedding = await context.embed(body);
-      if (!embedding.length || embedding.some((value) => !Number.isFinite(value))) throw new PlanetValidationError("EmbeddingProvider returned an invalid embedding.");
+      const embedding = vectors[index]!;
       await context.requireVector("write").upsert({ id: chunk.id, namespace: "document-chunk", model: context.embeddingProvider.model, embedding, metadata: { documentId: id, index }, scope: context.scope });
+      }
     }
   });
   await checkpoint?.("vectors_saved");
@@ -82,4 +83,3 @@ export async function ingestDocumentCore(input: DocumentIngestInput, context: Kn
   await checkpoint?.("knowledge_saved");
   return { document, chunks };
 }
-

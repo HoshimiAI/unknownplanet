@@ -2,11 +2,13 @@ import type {
   AddEvidenceInput, AddMemoryInput, BlobStorageAdapter, CreateDocumentInput, CreateEdgeInput, CreateNodeInput,
   DataLayerProvider, DocumentStore, EmbeddingProvider, EntityExtractor, EvidenceListInput, EvidenceStore, GraphNode, JsonObject,
   DocumentChunkStore, DocumentParser, GraphStore, IdentityStore, MemoryRecord, MemorySearchInput, MemoryStore, PlanetScope, ProviderCapability, ProviderOperation,
-  IngestionCheckpoint, IngestionJob, IngestionJobStore, NodeMergeRecord, PlanetIdentity, IdentityBinding, ProviderRouting, ProviderRoutingPolicy, SqlStore, SqlTransaction, VectorSearchInput, VectorStore,
+  IngestionCheckpoint, IngestionJob, IngestionJobStore, NodeMergeRecord, PlanetIdentity, IdentityBinding, ProviderRouting, ProviderRoutingPolicy, SqlStore, SqlTransaction, VectorCollectionConfig, VectorSearchInput, VectorStore,
 } from "@unknown-planet/core";
+import { EmbeddingDimensionMismatchError } from "@unknown-planet/core";
 import { withProviderSpan, withSpan } from "../observability/telemetry.js";
 import type { SpanContext } from "@opentelemetry/api";
 import { PlanetCapabilityError, PlanetConflictError, PlanetError, PlanetNotFoundError, PlanetProviderError, PlanetValidationError } from "../errors.js";
+import { EmbeddingService } from "./embedding.js";
 import { canonicalEntityName, entityNameSimilarity, stableUuid } from "./identity.js";
 import { decodeBase64, encodeBase64 } from "./encoding.js";
 import { decodeCursor, encodeCursor, pageById } from "./pagination.js";
@@ -28,6 +30,8 @@ export class Planet {
   private readonly scope: PlanetScope;
   private readonly routingPolicy?: ProviderRoutingPolicy;
   private readonly embeddingProvider?: EmbeddingProvider;
+  private readonly embeddingService: EmbeddingService;
+  private readonly vectorCollections: Readonly<Record<string, VectorCollectionConfig>>;
   private readonly entityExtractor?: EntityExtractor;
   private readonly documentParsers: Record<string, DocumentParser>;
   private readonly fuzzyEntityThreshold: number;
@@ -44,6 +48,7 @@ export class Planet {
       id: "inline",
       graph: config.graph,
       vector: config.vector,
+      vectorCollections: config.vectorCollections,
       documents: config.documents,
       chunks: config.chunks,
       evidence: config.evidence,
@@ -73,6 +78,8 @@ export class Planet {
       throw new PlanetValidationError("retrieval.graphDecay must be between 0 and 1.");
     }
     this.embeddingProvider = config.embeddings;
+    this.vectorCollections = Object.assign({}, ...this.providers.map((provider) => provider.vectorCollections ?? {}));
+    this.embeddingService = new EmbeddingService(this.embeddingProvider, this.vectorCollections);
     this.entityExtractor = config.extractor;
     this.documentParsers = config.documentParsers ?? {};
     this.fuzzyEntityThreshold = config.entityResolution?.fuzzyThreshold ?? 0.9;
@@ -83,9 +90,15 @@ export class Planet {
 
   readonly graph = {
     node: {
-      create: (input: CreateNodeInput) => this.requireGraph("write").createNode({ ...input, scope: this.scope }),
+      create: (input: CreateNodeInput) => {
+        if (input.embedding) this.embeddingService.validate(input.embedding, this.retrieval.nodeNamespace ?? "node", this.embeddingProvider?.model);
+        return this.requireGraph("write").createNode({ ...input, scope: this.scope });
+      },
       get: (id: string) => this.requireGraph("read").getNode(id, this.scope),
-      update: (id: string, input: Parameters<GraphStore["updateNode"]>[1]) => this.requireGraph("write").updateNode(id, { ...input, scope: this.scope }),
+      update: (id: string, input: Parameters<GraphStore["updateNode"]>[1]) => {
+        if (input.embedding) this.embeddingService.validate(input.embedding, this.retrieval.nodeNamespace ?? "node", this.embeddingProvider?.model);
+        return this.requireGraph("write").updateNode(id, { ...input, scope: this.scope });
+      },
       delete: (id: string) => this.requireGraph("write").deleteNode(id, this.scope),
       merge: async (input: { sourceId: string; targetId: string }) => {
         if (input.sourceId === input.targetId) throw new PlanetConflictError("A node cannot be merged into itself.");
@@ -153,9 +166,20 @@ export class Planet {
   };
 
   readonly vector = {
-    upsert: (input: Parameters<VectorStore["upsert"]>[0]) => this.requireVector("write").upsert({ ...input, scope: this.scope }),
-    search: (input: Parameters<VectorStore["search"]>[0]) => this.requireVector("search").search({ ...input, scope: this.scope }),
-    searchPage: async (input: VectorSearchInput & { cursor?: string }) => pageById(await this.requireVector("search").search({ ...input, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.id),
+    upsert: (input: Parameters<VectorStore["upsert"]>[0]) => {
+      this.embeddingService.validate(input.embedding, input.namespace, input.model);
+      return this.requireVector("write").upsert({ ...input, model: input.model ?? this.embeddingProvider?.model ?? this.vectorCollections[input.namespace]?.model, scope: this.scope });
+    },
+    search: (input: Parameters<VectorStore["search"]>[0]) => {
+      this.embeddingService.validate(input.embedding, input.namespace, input.model);
+      const model = input.model ?? this.embeddingProvider?.model ?? (input.namespace ? this.vectorCollections[input.namespace]?.model : undefined);
+      return this.requireVector("search").search({ ...input, model, scope: this.scope });
+    },
+    searchPage: async (input: VectorSearchInput & { cursor?: string }) => {
+      this.embeddingService.validate(input.embedding, input.namespace, input.model);
+      const model = input.model ?? this.embeddingProvider?.model ?? (input.namespace ? this.vectorCollections[input.namespace]?.model : undefined);
+      return pageById(await this.requireVector("search").search({ ...input, model, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.id);
+    },
     delete: (input: Parameters<VectorStore["delete"]>[0]) => this.requireVector("write").delete({ ...input, scope: this.scope }),
   };
 
@@ -250,18 +274,18 @@ export class Planet {
 
   /** Returns a client using the same providers with a different capability routing policy. */
   withRouting(routing: ProviderRouting): Planet {
-    return new Planet({ providers: this.providers, routing, embeddings: this.embeddingProvider, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
+    return new Planet({ providers: this.providers, routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
   }
 
   /** Returns a client with additional adapters. Existing provider ids remain protected from duplicates. */
   withProviders(providers: DataLayerProvider[], routing?: ProviderRouting): Planet {
-    return new Planet({ providers: [...this.providers, ...providers], routing: routing ?? this.routing, embeddings: this.embeddingProvider, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
+    return new Planet({ providers: [...this.providers, ...providers], routing: routing ?? this.routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
   }
 
   /** Returns an isolated client for one tenant or tenant/workspace request. */
   withScope(scope: PlanetScope, parentSpanContext?: SpanContext): Planet {
     if (!scope.tenantId.trim()) throw new PlanetValidationError("Planet scope requires a tenantId.");
-    const scoped = new Planet({ providers: this.providers, routing: this.routing, embeddings: this.embeddingProvider, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
+    const scoped = new Planet({ providers: this.providers, routing: this.routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
     scoped.telemetryParent = parentSpanContext;
     return scoped;
   }
@@ -296,8 +320,8 @@ export class Planet {
     return view;
   }
 
-  private classifyProviderError(capability: string, method: string, error: unknown): PlanetError {
-    if (error instanceof PlanetError) return error;
+  private classifyProviderError(capability: string, method: string, error: unknown): Error {
+    if (error instanceof PlanetError || error instanceof EmbeddingDimensionMismatchError) return error;
     const code = error && typeof error === "object" && "code" in error ? String((error as { code: unknown }).code) : "";
     const message = error instanceof Error ? error.message : "Storage provider failed.";
     if (code === "23505" || code === "11000") return new PlanetConflictError(message);
@@ -309,6 +333,14 @@ export class Planet {
   }
   private async providerCall<T>(capability: string, method: string, call: () => Promise<T>): Promise<T> {
     try { return await withProviderSpan(capability, method, call, capability === "EmbeddingProvider" ? this.embeddingProvider?.model : undefined); } catch (error) { throw this.classifyProviderError(capability, method, error); }
+  }
+
+  private embed(text: string, collections: readonly string[] = []): Promise<number[]> {
+    return this.providerCall("EmbeddingProvider", "embed", () => this.embeddingService.embed(text, collections));
+  }
+
+  private embedMany(texts: string[], collection?: string): Promise<number[][]> {
+    return this.providerCall("EmbeddingProvider", "embed_many", () => this.embeddingService.embedMany(texts, collection));
   }
 
   private extensionRoute(key: string): string | undefined {
@@ -350,7 +382,7 @@ export class Planet {
         .sort((left, right) => right.score - left.score || left.candidate.id.localeCompare(right.candidate.id));
       if (scored.length && (scored.length === 1 || scored[0]!.score > scored[1]!.score)) identity = scored[0]!.candidate;
       if (!identity && this.embeddingProvider && this.resolve("vector", "search")) {
-        const embedding = await this.providerCall("EmbeddingProvider", "embed", () => this.embeddingProvider!.embed({ text: entity.name }));
+        const embedding = await this.embed(entity.name, [`identity:${entity.type}`]);
         const vectorCandidates = await this.requireVector("search").search({
           embedding,
           namespace: `identity:${entity.type}`,
@@ -381,7 +413,7 @@ export class Planet {
       }
     }
     if (this.embeddingProvider && this.resolve("vector", "write")) {
-      const embedding = await this.providerCall("EmbeddingProvider", "embed", () => this.embeddingProvider!.embed({ text: identity.name }));
+      const embedding = await this.embed(identity.name, [`identity:${entity.type}`]);
       await this.requireVector("write").upsert({
         id: identity.id,
         namespace: `identity:${entity.type}`,
@@ -566,7 +598,8 @@ export class Planet {
       resolveEvidence: (operation) => this.resolve("evidence", operation),
       requireMemories: (operation) => this.requireMemories(operation),
       parse: (parser, data, contentType) => this.providerCall("DocumentParser", "parse", () => Promise.resolve(parser.parse({ data, contentType }))),
-      embed: (text) => this.providerCall("EmbeddingProvider", "embed", () => this.embeddingProvider!.embed({ text })),
+      embed: (text, collections) => this.embed(text, collections),
+      embedMany: (texts, collection) => this.embedMany(texts, collection),
       extractEntities: (text) => this.extractEntities(text),
       resolveEntityIdentity: (entity) => this.resolveEntityIdentity(entity),
       createGraphNode: (input) => this.createGraphNode(input),
@@ -587,7 +620,7 @@ export class Planet {
     const lexical = await this.requireMemories("search").search(filters);
     if (!input.query?.trim() || !this.embeddingProvider || !this.resolve("vector", "search")) return lexical;
     const query = input.query;
-    const embedding = await this.providerCall("EmbeddingProvider", "embed", () => this.embeddingProvider!.embed({ text: query }));
+    const embedding = await this.embed(query, ["memory"]);
     const vectors = await this.requireVector("search").search({ embedding, namespace: "memory", model: this.embeddingProvider?.model, limit: Math.min(limit * 3, 500), scope: this.scope });
     const semantic: MemoryRecord[] = [];
     for (const candidate of vectors) {
@@ -611,7 +644,7 @@ export class Planet {
       requireChunks: (operation) => this.requireChunks(operation),
       requireVector: (operation) => this.requireVector(operation),
       requireGraph: (operation) => this.requireGraph(operation),
-      embed: (text) => this.providerCall("EmbeddingProvider", "embed", () => this.embeddingProvider!.embed({ text })),
+      embed: (text, collection) => this.embed(text, collection ? [collection] : []),
     });
   }
 
@@ -623,7 +656,7 @@ export class Planet {
       requireGraph: (operation) => this.requireGraph(operation),
       requireVector: (operation) => this.requireVector(operation),
       resolveEvidence: (operation) => this.resolve("evidence", operation),
-      embed: (text) => this.providerCall("EmbeddingProvider", "embed", () => this.embeddingProvider!.embed({ text })),
+      embed: (text, collection) => this.embed(text, collection ? [collection] : []),
     });
   }
 

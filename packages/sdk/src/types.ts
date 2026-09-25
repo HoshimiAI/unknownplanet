@@ -1,7 +1,7 @@
 import type {
   BlobStorageAdapter, DataLayerProvider, DocumentChunkStore, DocumentParser, DocumentStore, EmbeddingProvider, EntityExtractor,
   Evidence, EvidenceStore, GraphEdge, GraphNode, GraphStore, IdentityStore, IngestionJobStore, MemoryStore, PlanetScope,
-  ProviderCapability, ProviderRouting, ProviderRoutingPolicy, SqlStore, VectorStore,
+  ProviderCapability, ProviderRouting, ProviderRoutingPolicy, SqlStore, VectorCollectionConfig, VectorStore,
 } from "@unknown-planet/core";
 
 export interface ProviderSelectionInput {
@@ -43,6 +43,7 @@ export interface PlanetConfig {
   /** Direct adapters remain supported for a single-provider setup. */
   graph?: GraphStore;
   vector?: VectorStore;
+  vectorCollections?: Readonly<Record<string, VectorCollectionConfig>>;
   documents?: DocumentStore;
   chunks?: DocumentChunkStore;
   evidence?: EvidenceStore;

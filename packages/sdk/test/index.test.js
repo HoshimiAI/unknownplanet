@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { definePlanetExtension, Planet, PlanetCapabilityError, PlanetConflictError, PlanetNotFoundError } from "../dist/index.js";
+import { definePlanetExtension, EmbeddingDimensionMismatchError, Planet, PlanetCapabilityError, PlanetConflictError, PlanetEmbeddingNotConfiguredError, PlanetNotFoundError } from "../dist/index.js";
 
 test("semantic search expands graph candidates and carries evidence", async () => {
   const first = { id: "a", type: "method", name: "Transformer", properties: {}, createdAt: new Date(), updatedAt: new Date() };
@@ -12,7 +12,7 @@ test("semantic search expands graph candidates and carries evidence", async () =
       traverse: async () => ({ nodes: [first, second], edges: [edge], depthByNode: { a: 0, b: 1 } }),
     } }, { id: "qdrant", vector: { upsert: async () => {}, delete: async () => {}, search: async () => [{ id: "a", namespace: "node", score: 0.9, metadata: {} }] } }],
     routing: { graph: "postgres", vector: "qdrant" },
-    embeddings: { embed: async () => [0.1, 0.2] },
+    embeddings: { model: "test", dimensions: 2, embed: async () => [0.1, 0.2] },
     evidence: { add: async () => { throw new Error("unused"); }, list: async () => [{ id: "ev", edgeId: "e", documentId: "d", extractor: "test", metadata: {}, createdAt: new Date() }] },
     retrieval: { graphDecay: 0.5, ranker: ({ results }) => [...results].reverse() },
   });
@@ -25,6 +25,18 @@ test("missing capabilities raise a stable typed SDK error", async () => {
   const planet = new Planet({});
   await expect(planet.memory.search({})).rejects.toBeInstanceOf(PlanetCapabilityError);
   await expect(planet.memory.search({})).rejects.toMatchObject({ code: "capability_unavailable", statusCode: 503 });
+});
+
+test("memory ingestion fails clearly without Planet-owned embeddings", async () => {
+  const planet = new Planet({ memories: { add: async () => { throw new Error("should not persist"); }, get: async () => null, search: async () => [], delete: async () => false } });
+  await expect(planet.memory.add({ agentId: "agent", content: "requires semantic indexing" })).rejects.toBeInstanceOf(PlanetEmbeddingNotConfiguredError);
+});
+
+test("Planet rejects provider and vector collection dimension mismatch at construction", () => {
+  expect(() => new Planet({
+    providers: [{ id: "pg", vectorCollections: { memory: { dimensions: 1536, model: "embed-v1" } }, vector: { upsert: async () => {}, search: async () => [], delete: async () => {} } }],
+    embeddings: { model: "embed-v1", dimensions: 1024, embed: async () => Array(1024).fill(0) },
+  })).toThrow(EmbeddingDimensionMismatchError);
 });
 
 test("node merge checks scoped endpoints before dispatching the audited merge", async () => {
@@ -109,8 +121,8 @@ test("routes scoped immutable identities to the catalog provider", async () => {
   expect(calls).toEqual([["create", "acme"], ["alias", "latest"]]);
 });
 
-test("memory ingestion embeds, resolves entities, writes graph evidence, and queries fused results", async () => {
-  const nodes = new Map(); const edges = new Map(); const vectors = new Map(); const memories = new Map(); const evidence = [];
+test("memory ingestion embeds once, resolves entities, writes graph evidence, and queries fused results", async () => {
+  const nodes = new Map(); const edges = new Map(); const vectors = new Map(); const memories = new Map(); const evidence = []; const embeddingInputs = [];
   const now = new Date();
   const graph = {
     createNode: async (input) => { const value = { id: input.id ?? `n${nodes.size}`, type: input.type, name: input.name, properties: input.properties ?? {}, createdAt: now, updatedAt: now }; nodes.set(value.id, value); return value; },
@@ -142,11 +154,12 @@ test("memory ingestion embeds, resolves entities, writes graph evidence, and que
       },
       vector: { upsert: async (record) => vectors.set(`${record.namespace}:${record.id}`, record), delete: async () => {}, search: async ({ namespace }) => [...vectors.values()].filter((record) => record.namespace === namespace).map((record) => ({ id: record.id, namespace, score: 0.9, metadata: record.metadata })) },
       evidence: { add: async (input) => { const row = { ...input, id: input.id, createdAt: now, metadata: input.metadata ?? {} }; evidence.push(row); return row; }, list: async ({ edgeId, edgeIds, sourceId }) => evidence.filter((row) => (!edgeId || row.edgeId === edgeId) && (!edgeIds || edgeIds.includes(row.edgeId)) && (!sourceId || row.sourceId === sourceId)) },
-    }], routing: { graph: "db", identities: "db", memories: "db", vector: "db", evidence: "db" }, embeddings: { embed: async () => [0.1, 0.2] },
+    }], routing: { graph: "db", identities: "db", memories: "db", vector: "db", evidence: "db" }, embeddings: { model: "test", dimensions: 2, embed: async ({ text }) => { embeddingInputs.push(text); return [0.1, 0.2]; } },
     extractor: { extract: async () => [{ name: "Attention", type: "METHOD", aliases: ["Attn"] }] },
   });
   const record = await planet.memory.add({ agentId: "research-agent", content: "Attention improved forecasting performance", source: { type: "experiment", id: "exp-42" } });
   const duplicate = await planet.memory.add({ agentId: "research-agent", content: "Attention improved forecasting performance", source: { type: "experiment", id: "exp-42" } });
+  expect(embeddingInputs.filter((text) => text === "Attention improved forecasting performance")).toHaveLength(2);
   expect(duplicate.id).toBe(record.id);
   expect(record.id).toBeDefined();
   expect(nodes.get(record.id).type).toBe("memory");
@@ -176,7 +189,7 @@ test("supporting and contradictory evidence coexist and deterministically update
 });
 
 test("document ingestion chunks HTML deterministically, tracks checkpoints, and reuses document/chunk identities", async () => {
-  const documents = new Map(); const chunks = new Map(); const jobs = new Map(); const vectorWrites = []; let failFirstVectorWrite = true;
+  const documents = new Map(); const chunks = new Map(); const jobs = new Map(); const vectorWrites = []; let failFirstVectorWrite = true; let batchCalls = 0; let singleCalls = 0;
   const now = new Date();
   const planet = new Planet({
     ingestionJobs: {
@@ -197,7 +210,8 @@ test("document ingestion chunks HTML deterministically, tracks checkpoints, and 
       deleteExcept: async ({ keepIds }) => { for (const id of chunks.keys()) if (!keepIds.includes(id)) chunks.delete(id); return 0; },
     },
     vector: { upsert: async (record) => { if (failFirstVectorWrite) { failFirstVectorWrite = false; throw new Error("temporary vector outage"); } vectorWrites.push(record); }, search: async () => [], delete: async () => {} },
-    embeddings: { model: "test-embed", embed: async () => [0.1, 0.2] },
+    vectorCollections: { "document-chunk": { dimensions: 2, model: "test-embed" } },
+    embeddings: { model: "test-embed", dimensions: 2, embed: async () => { singleCalls += 1; return [0.1, 0.2]; }, embedMany: async (texts) => { batchCalls += 1; return texts.map(() => [0.1, 0.2]); } },
   });
   const data = new TextEncoder().encode(`<html><body><p>${"A useful deterministic document chunk. ".repeat(8)}</p></body></html>`);
   let failedJobId;
@@ -219,6 +233,8 @@ test("document ingestion chunks HTML deterministically, tracks checkpoints, and 
   expect(first.chunks[0].text).not.toContain("<p>");
   expect(first.chunks.every((chunk) => chunk.startOffset <= chunk.endOffset)).toBe(true);
   expect(vectorWrites).toHaveLength(first.chunks.length * 3);
+  expect(batchCalls).toBe(4);
+  expect(singleCalls).toBe(0);
 });
 
 test("entity resolution normalizes organization variants and stores the variant as an alias", async () => {
@@ -242,7 +258,7 @@ test("entity resolution normalizes organization variants and stores the variant 
     providers: [{ id: "db", graph, identities: identityStore,
       memories: { add: async (input) => { const record = { ...input, type: input.type ?? "fact", metadata: {}, createdAt: now, updatedAt: now }; memories.set(record.id, record); return record; }, get: async (id) => memories.get(id) ?? null, search: async () => [], delete: async () => true },
       vector: { upsert: async () => {}, search: async () => [], delete: async () => {} },
-    }], routing: { graph: "db", identities: "db", memories: "db", vector: "db" }, embeddings: { embed: async () => [0.1] },
+    }], routing: { graph: "db", identities: "db", memories: "db", vector: "db" }, embeddings: { model: "test", dimensions: 1, embed: async () => [0.1] },
     extractor: { extract: async ({ text }) => [{ name: text.includes("revision") ? "Open AI" : "OpenAI", type: "ORG" }] },
   });
   await planet.memory.add({ id: "mem-1", agentId: "agent", content: "OpenAI research" });

@@ -12,7 +12,7 @@ const embeddingDimensions = Number(process.env.EMBEDDING_DIMENSIONS ?? 8);
 const tenantId = process.env.TENANT_ID ?? "local-dev";
 const workspaceId = process.env.WORKSPACE_ID;
 const planetSchema = process.env.PLANET_SCHEMA ?? "public";
-const embeddingModel = process.env.EMBEDDING_MODEL ?? "text-embedding-3-small";
+const embeddingModel = process.env.OPENAI_API_KEY ? (process.env.EMBEDDING_MODEL ?? "text-embedding-3-small") : "demo-character-hash";
 const telemetryEnabled = process.env.OTEL_SDK_DISABLED !== "true" && (process.env.OTEL_ENABLED === "true" || Boolean(process.env.OTEL_EXPORTER_OTLP_ENDPOINT || process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT || process.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT || process.env.OTEL_TRACES_EXPORTER || process.env.OTEL_METRICS_EXPORTER));
 const telemetrySdk = telemetryEnabled ? new NodeSDK({ serviceName: process.env.OTEL_SERVICE_NAME ?? "unknown-planet-elysia" }) : undefined;
 telemetrySdk?.start();
@@ -28,7 +28,7 @@ function demoEmbedding(text: string, dimensions = embeddingDimensions): number[]
 }
 
 const planet = new Planet({
-  providers: [createPostgresProvider({ database: pool, schema: planetSchema, vectorCollections: { node: { dimensions: embeddingDimensions, model: process.env.OPENAI_API_KEY ? embeddingModel : undefined }, memory: { dimensions: embeddingDimensions, model: process.env.OPENAI_API_KEY ? embeddingModel : undefined }, "document-chunk": { dimensions: embeddingDimensions, model: process.env.OPENAI_API_KEY ? embeddingModel : undefined } } })],
+  providers: [createPostgresProvider({ database: pool, schema: planetSchema, vectorCollections: { node: { dimensions: embeddingDimensions, model: embeddingModel }, memory: { dimensions: embeddingDimensions, model: embeddingModel }, "document-chunk": { dimensions: embeddingDimensions, model: embeddingModel } } })],
   scope: { tenantId, ...(workspaceId ? { workspaceId } : {}) },
   routing: {
     graph: "postgres",
@@ -42,8 +42,8 @@ const planet = new Planet({
   },
   // Deterministic local embeddings keep smoke tests self-contained. Production requires provider credentials.
   embeddings: process.env.OPENAI_API_KEY
-    ? new OpenAICompatibleEmbeddingProvider({ apiKey: process.env.OPENAI_API_KEY, model: embeddingModel, baseUrl: process.env.OPENAI_BASE_URL })
-    : { model: "demo-character-hash", embed: async ({ text }) => demoEmbedding(text) },
+    ? new OpenAICompatibleEmbeddingProvider({ apiKey: process.env.OPENAI_API_KEY, model: embeddingModel, baseUrl: process.env.OPENAI_BASE_URL, dimensions: embeddingDimensions })
+    : { model: embeddingModel, dimensions: embeddingDimensions, embed: async ({ text }) => demoEmbedding(text) },
   extractor: process.env.LLM_API_KEY && process.env.LLM_API_URL && process.env.LLM_MODEL
     ? new JsonHttpEntityExtractor({ apiKey: process.env.LLM_API_KEY, endpoint: process.env.LLM_API_URL, model: process.env.LLM_MODEL })
     : undefined,

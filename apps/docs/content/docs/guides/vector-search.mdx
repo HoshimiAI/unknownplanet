@@ -29,7 +29,18 @@ Each namespace identifies a collection of comparable vectors. Keep dimensions an
 
 ## Choose an embedding provider
 
-The SDK requires an `EmbeddingProvider` with `embed({ text })`. It exports `OpenAICompatibleEmbeddingProvider`, which posts to an OpenAI-compatible `/embeddings` endpoint, validates numeric output, records reported input token usage, and retries transient failures. Configure `dimensions` only when the selected API supports it and make the returned vector length match the store configuration.
+The SDK requires an `EmbeddingProvider` with a `model`, `dimensions`, and `embed({ text })`; providers may implement `embedMany(texts)` for batched ingestion. `PlanetConfig.embeddings` is the provider used for Unknown Planet memory, graph, document, and semantic retrieval ingestion. The SDK exports `OpenAICompatibleEmbeddingProvider`, but its internal contract is provider-independent, so local models and custom endpoints can implement the same interface. Missing embedding configuration fails clearly for operations that require vectors.
+
+```ts
+const embeddings = new OpenAICompatibleEmbeddingProvider({
+  apiKey: process.env.OPENAI_API_KEY!,
+  model: 'text-embedding-3-small',
+  dimensions: 1536,
+});
+const planet = new Planet({ providers: [postgres], embeddings });
+```
+
+Provider dimensions and model must match each configured vector collection. Planet validates compatibility when the client is constructed and validates returned or explicitly supplied vectors before writes. For direct `planet.vector.upsert({ embedding })`, Planet accepts that explicit vector and validates it; it does not regenerate it.
 
 The Elysia demo hash embedding is deterministic and dependency-free, useful for exercising vector persistence. It does not capture semantic similarity. For production use a model appropriate to the corpus and query language.
 
@@ -41,7 +52,7 @@ PostgreSQL uses pgvector distance search. The adapter can validate configured co
 
 - `graph.search({ semantic: true })` embeds a query, finds node candidates, then optionally expands graph connections.
 - `memory.search({ query })` combines lexical memory search with vector candidates when embeddings and vector routing exist.
-- `document.ingest` stores chunk vectors in namespace `document-chunk` when an embedding provider is configured.
+- `document.ingest` stores chunk vectors in namespace `document-chunk` when an embedding provider is configured, using `embedMany` when available.
 - `planet.query` can search graph vectors and document chunk vectors, then fuse them with keyword results.
 
 All are scoped by the current Planet client. A missing vector route can make an otherwise configured workflow fail; verify the routing map includes `vector`.

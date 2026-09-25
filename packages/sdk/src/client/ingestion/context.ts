@@ -16,9 +16,9 @@ export interface KnowledgeIngestionContext {
   resolveEvidence(operation: ProviderOperation): EvidenceStore | undefined;
   requireMemories(operation: ProviderOperation): MemoryStore;
   parse(parser: DocumentParser, data: Uint8Array, contentType: string): Promise<string>;
-  embed(text: string): Promise<number[]>;
+  embed(text: string, collections?: string[]): Promise<number[]>;
+  embedMany(texts: string[], collection?: string): Promise<number[][]>;
   extractEntities(text: string): Promise<Array<{ name: string; type: string; aliases: string[] }>>;
   resolveEntityIdentity(entity: { name: string; type: string; aliases: string[] }): Promise<PlanetIdentity | null>;
   createGraphNode(input: CreateNodeInput): Promise<GraphNode>;
 }
-

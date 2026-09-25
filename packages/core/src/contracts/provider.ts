@@ -14,7 +14,8 @@ export interface BlobStorageAdapter {
   delete(uri: string): Promise<void>;
 }
 
-export interface EmbeddingProvider { readonly model?: string; embed(input: { text: string }): Promise<number[]> }
+export interface EmbeddingProvider { readonly model: string; readonly dimensions: number; embed(input: { text: string }): Promise<number[]>; embedMany?(inputs: string[]): Promise<number[][]> }
+export interface VectorCollectionConfig { dimensions: number; model?: string }
 
 /**
  * A named implementation of one or more data capabilities. Providers can be mixed:
@@ -24,6 +25,8 @@ export interface DataLayerProvider {
   id: string;
   graph?: GraphStore;
   vector?: VectorStore;
+  /** Expected embedding dimensions/model for named vector namespaces. */
+  vectorCollections?: Readonly<Record<string, VectorCollectionConfig>>;
   documents?: DocumentStore;
   chunks?: DocumentChunkStore;
   evidence?: EvidenceStore;

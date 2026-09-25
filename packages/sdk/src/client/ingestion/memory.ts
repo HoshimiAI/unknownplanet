@@ -1,5 +1,5 @@
 import type { AddMemoryInput, GraphEdge, IngestionCheckpoint, MemoryRecord } from "@unknown-planet/core";
-import { PlanetCapabilityError, PlanetProviderError, PlanetValidationError } from "../../errors.js";
+import { PlanetProviderError, PlanetValidationError } from "../../errors.js";
 import { stableUuid } from "../identity.js";
 import type { KnowledgeIngestionContext } from "./context.js";
 
@@ -8,10 +8,9 @@ export async function addMemoryCore(input: AddMemoryInput, context: KnowledgeIng
   for (const [key, value] of [["importance", input.importance], ["confidence", input.confidence]] as const) if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 1)) throw new PlanetValidationError(`Memory ${key} must be between 0 and 1.`);
   const id = input.id ?? (input.source ? await stableUuid(`memory:${context.scope.tenantId}:${context.scope.workspaceId ?? ""}:${input.source.type}:${input.source.id}`) : crypto.randomUUID());
   const [embedding, entities] = await Promise.all([
-    context.embeddingProvider ? context.embed(input.content) : Promise.reject(new PlanetCapabilityError("EmbeddingProvider")),
+    context.embed(input.content, ["memory", context.retrieval.nodeNamespace ?? "node"]),
     context.extractEntities(input.content),
   ]);
-  if (!embedding.length || embedding.some((value) => !Number.isFinite(value))) throw new PlanetValidationError("EmbeddingProvider returned an invalid embedding.");
   const record = await context.requireMemories("write").add({ ...input, id, content: input.content.trim(), scope: context.scope });
   await checkpoint?.("memory_saved");
   await context.requireVector("write").upsert({ id, namespace: "memory", embedding, model: context.embeddingProvider?.model, metadata: { agentId: record.agentId, userId: record.userId ?? "", sessionId: record.sessionId ?? "", type: record.type }, scope: context.scope });

@@ -13,7 +13,7 @@ export interface QueryContext {
   requireChunks(operation: ProviderOperation): DocumentChunkStore;
   requireVector(operation: ProviderOperation): VectorStore;
   requireGraph(operation: ProviderOperation): GraphStore;
-  embed(text: string): Promise<number[]>;
+  embed(text: string, collection?: string): Promise<number[]>;
 }
 
 export async function queryKnowledge(input: PlanetQueryInput, context: QueryContext): Promise<PlanetQueryResult[]> {
@@ -24,7 +24,7 @@ export async function queryKnowledge(input: PlanetQueryInput, context: QueryCont
   const vectorPromise = search.vector ? context.searchGraph({ query: input.text, semantic: true, limit: limit * 3, graph: { depth: search.graph ? input.expand?.relationDepth ?? 1 : 0 }, asOf: input.asOf }) : Promise.resolve([]);
   const chunkKeywordPromise = search.keyword && context.resolveChunks("search") ? context.requireChunks("search").search({ query: input.text, limit: limit * 3, scope: context.scope }) : Promise.resolve([]);
   const chunkVectorPromise = search.vector && context.embeddingProvider && context.resolveVector("search") ? (async () => {
-    const embedding = await context.embed(input.text);
+    const embedding = await context.embed(input.text, "document-chunk");
     const matches = await context.requireVector("search").search({ embedding, namespace: "document-chunk", model: context.embeddingProvider!.model, limit: limit * 3, scope: context.scope });
     const records = [];
     for (const match of matches) { const chunk = await context.requireChunks("read").get(match.id, context.scope); if (chunk && (!input.filters?.documentId || chunk.documentId === input.filters.documentId)) records.push({ chunk, score: match.score }); }
