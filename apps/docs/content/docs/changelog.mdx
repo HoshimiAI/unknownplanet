@@ -1,0 +1,33 @@
+---
+title: Changelog
+description: Product and platform changes in Unknown Planet.
+---
+
+## Unreleased
+
+### Added
+
+- Added provider contracts and adapters for SQL, custom MongoDB collections,
+  queues, stacks, key/value storage, SQLite, Neo4j, Qdrant, Redis, and MinIO.
+- Added JSON validation through `validationSchemas`; the legacy
+  `customSchemas` option remains an alias.
+- Added provider-backed pagination for evidence, chunks, identities, and graph
+  merge history.
+
+### Changed
+
+- Routed application-owned SQL and registered MongoDB collection operations
+  through Planet providers. Applications own their table and collection
+  migrations.
+- Clarified that applications manage database migrations, indexes, and
+  constraints, while Planet focuses on the ingest → retrieve → cite workflow.
+- Large durable document inputs now use blob storage instead of job payloads.
+
+### Fixed
+
+- Added versioned PostgreSQL and MongoDB scope keys. Existing deployments need
+  an explicit migration; colon-bearing legacy keys need tenant/workspace maps.
+- Fenced ingestion job updates with lease tokens to stop expired workers from
+  overwriting later claims.
+- Allowed persisted memories to be deleted without graph or vector providers.
+- Added ranked pagination cursors that detect changed result windows.
