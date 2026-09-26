@@ -42,9 +42,13 @@ curl 'http://localhost:3000/v1/memory?agentId=research-agent&text=forecasting'
 curl -X POST http://localhost:3000/v1/vectors \
   -H 'content-type: application/json' \
   -d '{"id":"example-1","namespace":"demo","embedding":[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]}'
+
+curl -X POST http://localhost:3000/v1/query \
+  -H 'content-type: application/json' \
+  -d '{"text":"forecasting","search":{"keyword":true,"vector":false,"graph":false},"includeEvidence":true}'
 ```
 
-The vector length must match `EMBEDDING_DIMENSIONS` (8 by default). Memory writes also use vector storage for semantic retrieval. See [features](/docs/features) for the SDK and HTTP capabilities.
+The vector length must match `EMBEDDING_DIMENSIONS` (8 by default). Memory writes also use vector storage for semantic retrieval. The keyword query demonstrates the ingestion to retrieval path without relying on the demo embedding's semantic quality. See [features](/docs/features) for the SDK and HTTP capabilities.
 
 ## Check service health
 

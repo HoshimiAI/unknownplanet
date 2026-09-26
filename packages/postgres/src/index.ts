@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { metrics, SpanStatusCode, trace } from "@opentelemetry/api";
-import { EmbeddingDimensionMismatchError, type AddEvidenceInput, type AddMemoryInput, type CreateDocumentChunkInput, type CreateDocumentInput, type CreateEdgeInput, type CreateIngestionJobInput, type CreateNodeInput, type DataLayerProvider, type DocumentChunk, type DocumentChunkStore, type DocumentId, type DocumentStore, type EdgeId, type Evidence, type EvidenceListInput, type EvidenceStore, type GraphEdge, type GraphNode, type GraphStore, type GraphTraversal, type IdentityBinding, type IdentityStore, type IngestionJob, type IngestionJobStore, type JsonObject, type MemoryRecord, type MemorySearchInput, type MemoryStore, type NeighborsInput, type NodeId, type NodeMergeRecord, type PlanetDocument, type PlanetIdentity, type PlanetScope, type SqlQueryInput, type SqlQueryResult, type SqlStore, type SqlTransaction, type TraverseInput, type UpdateEdgeInput, type UpdateIngestionJobInput, type UpdateNodeInput, type VectorCollectionConfig as CoreVectorCollectionConfig, type VectorRecord, type VectorSearchInput, type VectorSearchResult, type VectorStore } from "@unknown-planet/core";
+import { scopeStorageKey } from "@unknown-planet/core";
+import { EmbeddingDimensionMismatchError, type AddEvidenceInput, type AddMemoryInput, type ClaimedQueueMessage, type CreateDocumentChunkInput, type CreateDocumentInput, type CreateEdgeInput, type CreateIngestionJobInput, type CreateNodeInput, type DataLayerProvider, type DocumentChunk, type DocumentChunkStore, type DocumentId, type DocumentStore, type EdgeId, type Evidence, type EvidenceListInput, type EvidenceStore, type GraphEdge, type GraphNode, type GraphStore, type GraphTraversal, type IdentityBinding, type IdentityStore, type IngestionJob, type IngestionJobStore, type JsonObject, type JsonValue, type MemoryRecord, type MemorySearchInput, type MemoryStore, type NeighborsInput, type NodeId, type NodeMergeRecord, type PlanetDocument, type PlanetIdentity, type PlanetScope, type QueueMessage, type QueueStore, type StackStore, type KeyValueStore, type SqlQueryInput, type SqlQueryResult, type SqlStore, type SqlTransaction, type TraverseInput, type UpdateEdgeInput, type UpdateIngestionJobInput, type UpdateNodeInput, type VectorCollectionConfig as CoreVectorCollectionConfig, type VectorRecord, type VectorSearchInput, type VectorSearchResult, type VectorStore } from "@unknown-planet/core";
 
 export interface PostgresDatabase { query<T extends Record<string, unknown> = Record<string, unknown>>(text: string, values?: readonly unknown[]): Promise<{ rows: T[]; rowCount: number | null }> }
 export interface PostgresConnection extends PostgresDatabase { release(): void }
 export interface PostgresTransactionalDatabase extends PostgresDatabase { connect(): Promise<PostgresConnection> }
 const supportsTransactions = (database: PostgresDatabase): database is PostgresTransactionalDatabase => "connect" in database && typeof database.connect === "function";
-const scopeId = (scope?: PlanetScope) => scope?.workspaceId ? `${scope.tenantId}:${scope.workspaceId}` : (scope?.tenantId ?? "default");
+const scopeId = scopeStorageKey;
 const dbTracer = trace.getTracer("@unknown-planet/postgres", "0.1.0");
 const dbMeter = metrics.getMeter("@unknown-planet/postgres", "0.1.0");
 const dbQueries = dbMeter.createCounter("db.client.operation.count", { description: "PostgreSQL queries issued by Unknown Planet" });
@@ -33,7 +34,7 @@ function instrumentPostgresDatabase(database: PostgresDatabase): PostgresDatabas
 type NodeRow = { id: string; type: string; name: string; properties: JsonObject; embedding: string | null; created_at: Date; updated_at: Date };
 type EdgeRow = { id: string; source_id: string; target_id: string; relation: string; properties: JsonObject; confidence: number | null; valid_from: Date | null; valid_to: Date | null; status: GraphEdge["status"]; created_at: Date; updated_at: Date };
 type NodeMergeRow = { source_id: string; target_id: string; merged_at: Date; source_node: GraphNode; target_before: GraphNode; target_after: GraphNode };
-type IngestionJobRow = { id: string; kind: IngestionJob["kind"]; status: IngestionJob["status"]; checkpoint: IngestionJob["checkpoint"]; attempts: number; max_attempts: number; input: JsonObject; next_attempt_at: Date; lease_until: Date | null; last_error: string | null; created_at: Date; updated_at: Date };
+type IngestionJobRow = { id: string; kind: IngestionJob["kind"]; status: IngestionJob["status"]; checkpoint: IngestionJob["checkpoint"]; attempts: number; max_attempts: number; input: JsonObject; next_attempt_at: Date; lease_until: Date | null; lease_token: string | null; last_error: string | null; created_at: Date; updated_at: Date };
 type DocumentRow = { id: string; external_id: string | null; title: string; content_uri: string; metadata: JsonObject; created_at: Date; updated_at: Date };
 type ChunkRow = { id: string; document_id: string; content_uri: string | null; text_content: string | null; start_offset: number | null; end_offset: number | null; metadata: JsonObject; created_at: Date; updated_at: Date };
 type EvidenceRow = { id: string; edge_id: string; document_id: string | null; source_id: string | null; chunk_id: string | null; source_type: string | null; extractor: string; confidence: number | null; direction: Evidence["direction"]; strength: number | null; metadata: JsonObject; created_at: Date };
@@ -42,18 +43,33 @@ const vectorLiteral = (value: number[]) => { if (!value.length || value.some((n)
 const parseVector = (value: string | null): number[] | undefined => value === null ? undefined : JSON.parse(value.replaceAll("{", "[").replaceAll("}", "]")) as number[];
 const node = (row: NodeRow): GraphNode => ({ id: row.id, type: row.type, name: row.name, properties: row.properties ?? {}, embedding: parseVector(row.embedding), createdAt: row.created_at, updatedAt: row.updated_at });
 const rowToMerge = (row: NodeMergeRow): NodeMergeRecord => ({ sourceId: row.source_id, targetId: row.target_id, mergedAt: row.merged_at, source: { ...row.source_node, createdAt: new Date(row.source_node.createdAt), updatedAt: new Date(row.source_node.updatedAt) }, targetBefore: { ...row.target_before, createdAt: new Date(row.target_before.createdAt), updatedAt: new Date(row.target_before.updatedAt) }, targetAfter: { ...row.target_after, createdAt: new Date(row.target_after.createdAt), updatedAt: new Date(row.target_after.updatedAt) } });
-const rowToIngestionJob = (row: IngestionJobRow): IngestionJob => ({ id: row.id, kind: row.kind, status: row.status, checkpoint: row.checkpoint, attempts: row.attempts, maxAttempts: row.max_attempts, input: row.input ?? {}, nextAttemptAt: row.next_attempt_at, leaseUntil: row.lease_until ?? undefined, lastError: row.last_error ?? undefined, createdAt: row.created_at, updatedAt: row.updated_at });
+const rowToIngestionJob = (row: IngestionJobRow): IngestionJob => ({ id: row.id, kind: row.kind, status: row.status, checkpoint: row.checkpoint, attempts: row.attempts, maxAttempts: row.max_attempts, input: row.input ?? {}, nextAttemptAt: row.next_attempt_at, leaseUntil: row.lease_until ?? undefined, leaseToken: row.lease_token ?? undefined, lastError: row.last_error ?? undefined, createdAt: row.created_at, updatedAt: row.updated_at });
 const edge = (row: EdgeRow): GraphEdge => ({ id: row.id, sourceId: row.source_id, targetId: row.target_id, relation: row.relation, properties: row.properties ?? {}, confidence: row.confidence ?? undefined, validFrom: row.valid_from ?? undefined, validTo: row.valid_to ?? undefined, status: row.status ?? "candidate", createdAt: row.created_at, updatedAt: row.updated_at });
 const document = (row: DocumentRow): PlanetDocument => ({ id: row.id, externalId: row.external_id ?? undefined, title: row.title, contentUri: row.content_uri, metadata: row.metadata ?? {}, createdAt: row.created_at, updatedAt: row.updated_at });
 const chunk = (row: ChunkRow): DocumentChunk => ({ id: row.id, documentId: row.document_id, contentUri: row.content_uri ?? undefined, text: row.text_content ?? undefined, startOffset: row.start_offset ?? undefined, endOffset: row.end_offset ?? undefined, metadata: row.metadata ?? {}, createdAt: row.created_at, updatedAt: row.updated_at });
 const toEvidence = (row: EvidenceRow): Evidence => ({ id: row.id, edgeId: row.edge_id, documentId: row.document_id ?? undefined, sourceId: row.source_id ?? undefined, chunkId: row.chunk_id ?? undefined, sourceType: row.source_type ?? undefined, extractor: row.extractor, confidence: row.confidence ?? undefined, direction: row.direction ?? "support", strength: row.strength ?? undefined, metadata: row.metadata ?? {}, createdAt: row.created_at });
 const identifier = (value: string) => { if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) throw new Error("PostgreSQL schema names must be simple identifiers."); return `"${value}"`; };
-const planetTables = "nodes|edges|entity_merges|documents|document_chunks|evidence|vectors|memories|ingestion_jobs|identities|identity_aliases|identity_bindings";
-function schemaDatabase(database: PostgresDatabase, schema = "public"): PostgresDatabase {
-  if (schema === "public") return database;
-  const quoted = identifier(schema);
-  const relation = new RegExp(`\\b(DELETE\\s+FROM|FROM|JOIN|INTO|UPDATE|REFERENCES)\\s+(${planetTables})\\b`, "gi");
-  const route = (text: string) => text.replace(relation, (_match, keyword: string, table: string) => `${keyword} ${quoted}.${table}`);
+const featureTables = {
+  graph: ["nodes", "edges", "entity_merges"],
+  vector: ["vectors"],
+  documents: ["documents"],
+  chunks: ["document_chunks"],
+  evidence: ["evidence"],
+  memories: ["memories"],
+  ingestionJobs: ["ingestion_jobs"],
+  identities: ["identities", "identity_aliases", "identity_bindings"],
+  queue: ["queue_messages"],
+  stack: ["stack_entries"],
+  keyValue: ["key_values"],
+  sql: [],
+} as const;
+export type PostgresSchemaFeature = keyof typeof featureTables;
+
+function schemaDatabase(database: PostgresDatabase, schemas: Readonly<Record<string, string>>): PostgresDatabase {
+  const tableSchemas = Object.fromEntries(Object.entries(featureTables).flatMap(([feature, tables]) => tables.map((table) => [table, schemas[feature]!]))) as Record<string, string>;
+  const routedTables = Object.keys(tableSchemas).join("|");
+  const relation = new RegExp(`\\b(DELETE\\s+FROM|FROM|JOIN|INTO|UPDATE|REFERENCES)\\s+(${routedTables})\\b`, "gi");
+  const route = (text: string) => text.replace(relation, (_match, keyword: string, table: string) => tableSchemas[table] === "public" ? `${keyword} ${table}` : `${keyword} ${identifier(tableSchemas[table]!)}.${table}`);
   const scoped: PostgresDatabase & Partial<PostgresTransactionalDatabase> = {
     query: <T extends Record<string, unknown> = Record<string, unknown>>(text: string, values?: readonly unknown[]) => database.query<T>(route(text), values),
   };
@@ -104,6 +120,11 @@ export class PostgresGraphStore implements GraphStore {
     const result = await this.db.query<NodeMergeRow>(`SELECT source_id,target_id,merged_at,source_node,target_before,target_after FROM entity_merges WHERE scope_id=$1${filter} ORDER BY merged_at DESC,source_id LIMIT $${values.length}`, values);
     return result.rows.map(rowToMerge);
   }
+  async listMergesPage(input: { nodeId?: NodeId; limit?: number; afterSourceId?: string; scope?: PlanetScope }): Promise<{ items: NodeMergeRecord[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const rows = (await this.db.query<NodeMergeRow>(`SELECT source_id,target_id,merged_at,source_node,target_before,target_after FROM entity_merges WHERE scope_id=$1 AND ($2::uuid IS NULL OR source_id>$2::uuid) AND ($3::uuid IS NULL OR source_id=$3::uuid OR target_id=$3::uuid) ORDER BY source_id LIMIT $4`, [scopeId(input.scope), input.afterSourceId ?? null, input.nodeId ?? null, limit + 1])).rows;
+    return { items: rows.slice(0, limit).map(rowToMerge), hasMore: rows.length > limit };
+  }
   async createEdge(input: CreateEdgeInput): Promise<GraphEdge> { if (input.validFrom && input.validTo && input.validTo <= input.validFrom) throw new Error("validTo must be later than validFrom."); const result = await this.db.query<EdgeRow>(`INSERT INTO edges (id,scope_id,source_id,target_id,relation,properties,confidence,valid_from,valid_to,status) SELECT $1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10 WHERE EXISTS (SELECT 1 FROM nodes WHERE id=$3 AND scope_id=$2) AND EXISTS (SELECT 1 FROM nodes WHERE id=$4 AND scope_id=$2) RETURNING ${edges}`, [input.id ?? randomUUID(), scopeId(input.scope), input.from, input.to, input.relation, JSON.stringify(input.properties ?? {}), input.confidence ?? null, input.validFrom ?? null, input.validTo ?? null, input.status ?? "candidate"]); if (!result.rows[0]) throw new Error("Cannot create an edge whose endpoint node does not exist in this scope."); return edge(result.rows[0]); }
   async getEdge(id: EdgeId, scope?: PlanetScope): Promise<GraphEdge | null> { const result = await this.db.query<EdgeRow>(`SELECT ${edges} FROM edges WHERE id=$1 AND scope_id=$2`, [id, scopeId(scope)]); return result.rows[0] ? edge(result.rows[0]) : null; }
   async updateEdge(id: EdgeId, input: UpdateEdgeInput): Promise<GraphEdge | null> { const setters: string[] = []; const values: unknown[] = []; const add = (field: string, value: unknown) => { values.push(value); setters.push(`${field}=$${values.length}`); }; if (input.confidence !== undefined) add("confidence", input.confidence); if (input.status !== undefined) add("status", input.status); if (input.validFrom !== undefined) add("valid_from", input.validFrom); if (input.validTo !== undefined) add("valid_to", input.validTo); if (input.properties !== undefined) add("properties", JSON.stringify(input.properties)); if (!setters.length) return this.getEdge(id, input.scope); values.push(id, scopeId(input.scope)); const result = await this.db.query<EdgeRow>(`UPDATE edges SET ${setters.join(",")},updated_at=now() WHERE id=$${values.length - 1} AND scope_id=$${values.length} RETURNING ${edges}`, values); return result.rows[0] ? edge(result.rows[0]) : null; }
@@ -115,6 +136,14 @@ export class PostgresGraphStore implements GraphStore {
 }
 export class PostgresDocumentStore implements DocumentStore { constructor(private readonly db: PostgresDatabase) {} async create(input: CreateDocumentInput): Promise<PlanetDocument> { const result = await this.db.query<DocumentRow>(`INSERT INTO documents (id,scope_id,external_id,title,content_uri,metadata) VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT (id) DO UPDATE SET title=EXCLUDED.title,content_uri=EXCLUDED.content_uri,metadata=EXCLUDED.metadata,updated_at=now() WHERE documents.scope_id=EXCLUDED.scope_id RETURNING ${documents}`, [input.id ?? randomUUID(), scopeId(input.scope), input.externalId ?? null, input.title, input.contentUri, JSON.stringify(input.metadata ?? {})]); if (!result.rows[0]) throw new Error("Document id already exists outside this scope."); return document(result.rows[0]); } async get(id: DocumentId, scope?: PlanetScope): Promise<PlanetDocument | null> { const result = await this.db.query<DocumentRow>(`SELECT ${documents} FROM documents WHERE id=$1 AND scope_id=$2`, [id, scopeId(scope)]); return result.rows[0] ? document(result.rows[0]) : null; } async delete(id: DocumentId, scope?: PlanetScope): Promise<boolean> { const result = await this.db.query("DELETE FROM documents WHERE id=$1 AND scope_id=$2", [id, scopeId(scope)]); return (result.rowCount ?? 0) > 0; } }
 export class PostgresDocumentChunkStore implements DocumentChunkStore { constructor(private readonly db: PostgresDatabase) {} async create(input: CreateDocumentChunkInput): Promise<DocumentChunk> { if (!input.text && !input.contentUri) throw new Error("A document chunk requires text or a content URI."); const result = await this.db.query<ChunkRow>(`INSERT INTO document_chunks (id,scope_id,document_id,content_uri,text_content,start_offset,end_offset,metadata) SELECT $1,$2,$3,$4,$5,$6,$7,$8::jsonb WHERE EXISTS (SELECT 1 FROM documents WHERE id=$3 AND scope_id=$2) ON CONFLICT (id) DO UPDATE SET content_uri=EXCLUDED.content_uri,text_content=EXCLUDED.text_content,start_offset=EXCLUDED.start_offset,end_offset=EXCLUDED.end_offset,metadata=EXCLUDED.metadata,updated_at=now() WHERE document_chunks.scope_id=EXCLUDED.scope_id AND document_chunks.document_id=EXCLUDED.document_id RETURNING ${chunks}`, [input.id ?? randomUUID(), scopeId(input.scope), input.documentId, input.contentUri ?? null, input.text ?? null, input.startOffset ?? null, input.endOffset ?? null, JSON.stringify(input.metadata ?? {})]); if (!result.rows[0]) throw new Error("A chunk requires an existing document in this scope and cannot be moved between documents."); return chunk(result.rows[0]); } async get(id: string, scope?: PlanetScope): Promise<DocumentChunk | null> { const result = await this.db.query<ChunkRow>(`SELECT ${chunks} FROM document_chunks WHERE id=$1 AND scope_id=$2`, [id, scopeId(scope)]); return result.rows[0] ? chunk(result.rows[0]) : null; } async list(input: { documentId: string; limit?: number; scope?: PlanetScope }): Promise<DocumentChunk[]> { const result = await this.db.query<ChunkRow>(`SELECT ${chunks} FROM document_chunks WHERE document_id=$1 AND scope_id=$2 ORDER BY start_offset NULLS LAST,id LIMIT $3`, [input.documentId, scopeId(input.scope), input.limit ?? 100]); return result.rows.map(chunk); } async listPage(input: { documentId: string; limit?: number; afterId?: string; scope?: PlanetScope }): Promise<{ items: DocumentChunk[]; hasMore: boolean }> { const limit = Math.max(1, Math.min(input.limit ?? 100, 500)); const result = await this.db.query<ChunkRow>("SELECT * FROM document_chunks WHERE document_id=$1 AND scope_id=$2 AND ($3::uuid IS NULL OR id>$3::uuid) ORDER BY id LIMIT $4", [input.documentId, scopeId(input.scope), input.afterId ?? null, limit + 1]); return { items: result.rows.slice(0, limit).map(chunk), hasMore: result.rows.length > limit }; } async search(input: { query: string; limit?: number; scope?: PlanetScope }): Promise<DocumentChunk[]> { const result = await this.db.query<ChunkRow>(`SELECT ${chunks} FROM document_chunks WHERE scope_id=$1 AND to_tsvector('simple',coalesce(text_content,'')) @@ plainto_tsquery('simple',$2) ORDER BY ts_rank(to_tsvector('simple',coalesce(text_content,'')),plainto_tsquery('simple',$2)) DESC,id LIMIT $3`, [scopeId(input.scope), input.query, input.limit ?? 20]); return result.rows.map(chunk); } async deleteExcept(input: { documentId: string; keepIds: string[]; scope?: PlanetScope }): Promise<number> { const result = await this.db.query("DELETE FROM document_chunks WHERE scope_id=$1 AND document_id=$2 AND NOT (id=ANY($3::uuid[]))", [scopeId(input.scope), input.documentId, input.keepIds]); return result.rowCount ?? 0; } }
+export class PostgresPagedDocumentChunkStore extends PostgresDocumentChunkStore {
+  constructor(private readonly pageDb: PostgresDatabase) { super(pageDb); }
+  async searchPage(input: { query: string; limit?: number; afterId?: string; scope?: PlanetScope }): Promise<{ items: DocumentChunk[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 20, 500));
+    const rows = (await this.pageDb.query<ChunkRow>(`SELECT ${chunks} FROM document_chunks WHERE scope_id=$1 AND to_tsvector('simple',coalesce(text_content,'')) @@ plainto_tsquery('simple',$2) AND ($3::uuid IS NULL OR id>$3::uuid) ORDER BY id LIMIT $4`, [scopeId(input.scope), input.query, input.afterId ?? null, limit + 1])).rows;
+    return { items: rows.slice(0, limit).map(chunk), hasMore: rows.length > limit };
+  }
+}
 export class PostgresEvidenceStore implements EvidenceStore {
   constructor(private readonly db: PostgresDatabase) {}
   async add(input: AddEvidenceInput): Promise<Evidence> {
@@ -132,7 +161,20 @@ export class PostgresEvidenceStore implements EvidenceStore {
     values.push(input.limit ?? 100); const result = await this.db.query<EvidenceRow>(`SELECT ${evidence} FROM evidence WHERE ${clauses.join(" AND ")} ORDER BY created_at,id LIMIT $${values.length}`, values);
     return result.rows.map(toEvidence);
   }
+  async listPage(input: EvidenceListInput & { afterId?: string }): Promise<{ items: Evidence[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const values: unknown[] = [scopeId(input.scope)]; const clauses = ["scope_id=$1"];
+    if (input.edgeId) { values.push(input.edgeId); clauses.push(`edge_id=$${values.length}`); }
+    if (input.edgeIds?.length) { values.push(input.edgeIds); clauses.push(`edge_id=ANY($${values.length}::uuid[])`); }
+    if (input.documentId) { values.push(input.documentId); clauses.push(`document_id=$${values.length}`); }
+    if (input.sourceId) { values.push(input.sourceId); clauses.push(`source_id=$${values.length}`); }
+    if (input.afterId) { values.push(input.afterId); clauses.push(`id>$${values.length}::uuid`); }
+    values.push(limit + 1);
+    const rows = (await this.db.query<EvidenceRow>(`SELECT ${evidence} FROM evidence WHERE ${clauses.join(" AND ")} ORDER BY id LIMIT $${values.length}`, values)).rows;
+    return { items: rows.slice(0, limit).map(toEvidence), hasMore: rows.length > limit };
+  }
   async deleteByDocument(input: { documentId: string; scope?: PlanetScope }): Promise<number> { const result = await this.db.query("DELETE FROM evidence WHERE scope_id=$1 AND document_id=$2", [scopeId(input.scope), input.documentId]); return result.rowCount ?? 0; }
+  async deleteByChunks(input: { chunkIds: string[]; scope?: PlanetScope }): Promise<number> { if (!input.chunkIds.length) return 0; const result = await this.db.query("DELETE FROM evidence WHERE scope_id=$1 AND chunk_id=ANY($2::text[])", [scopeId(input.scope), input.chunkIds]); return result.rowCount ?? 0; }
 }
 
 type MemoryRow = { id: string; agent_id: string; user_id: string | null; session_id: string | null; content: string; memory_type: MemoryRecord["type"]; importance: number | null; confidence: number | null; source: MemoryRecord["source"] | null; metadata: JsonObject; created_at: Date; updated_at: Date };
@@ -167,12 +209,12 @@ export class PostgresMemoryStore implements MemoryStore {
   }
   async delete(id: string, scope?: PlanetScope): Promise<boolean> { const result = await this.db.query("DELETE FROM memories WHERE scope_id=$1 AND id=$2", [scopeId(scope), id]); return (result.rowCount ?? 0) > 0; }
 }
-const ingestionJobFields = "id,kind,status,checkpoint,attempts,max_attempts,input,next_attempt_at,lease_until,last_error,created_at,updated_at";
+const ingestionJobFields = "id,kind,status,checkpoint,attempts,max_attempts,input,next_attempt_at,lease_until,lease_token,last_error,created_at,updated_at";
 export class PostgresIngestionJobStore implements IngestionJobStore {
   constructor(private readonly db: PostgresDatabase) {}
   async create(input: CreateIngestionJobInput): Promise<IngestionJob> {
-    const result = await this.db.query<IngestionJobRow>(`INSERT INTO ingestion_jobs(id,scope_id,kind,status,checkpoint,attempts,max_attempts,input,next_attempt_at) VALUES($1,$2,$3,'queued','queued',0,$4,$5::jsonb,now()) ON CONFLICT(scope_id,id) DO UPDATE SET status='queued',checkpoint='queued',attempts=0,max_attempts=EXCLUDED.max_attempts,input=EXCLUDED.input,next_attempt_at=now(),lease_until=NULL,last_error=NULL,updated_at=now() RETURNING ${ingestionJobFields}`, [input.id, scopeId(input.scope), input.kind, input.maxAttempts ?? 5, JSON.stringify(input.input)]);
-    return rowToIngestionJob(result.rows[0]!);
+    const result = await this.db.query<IngestionJobRow>(`INSERT INTO ingestion_jobs(id,scope_id,kind,status,checkpoint,attempts,max_attempts,input,next_attempt_at) VALUES($1,$2,$3,'queued','queued',0,$4,$5::jsonb,now()) ON CONFLICT(scope_id,id) DO UPDATE SET status='queued',checkpoint='queued',attempts=0,max_attempts=EXCLUDED.max_attempts,input=EXCLUDED.input,next_attempt_at=now(),lease_until=NULL,lease_token=NULL,last_error=NULL,updated_at=now() WHERE ingestion_jobs.status IN ('succeeded','failed') RETURNING ${ingestionJobFields}`, [input.id, scopeId(input.scope), input.kind, input.maxAttempts ?? 5, JSON.stringify(input.input)]);
+    return result.rows[0] ? rowToIngestionJob(result.rows[0]) : (await this.get(input.id, input.scope))!;
   }
   async get(id: string, scope?: PlanetScope): Promise<IngestionJob | null> { const result = await this.db.query<IngestionJobRow>(`SELECT ${ingestionJobFields} FROM ingestion_jobs WHERE scope_id=$1 AND id=$2`, [scopeId(scope), id]); return result.rows[0] ? rowToIngestionJob(result.rows[0]) : null; }
   async update(input: UpdateIngestionJobInput): Promise<IngestionJob> {
@@ -183,17 +225,25 @@ export class PostgresIngestionJobStore implements IngestionJobStore {
     if (input.attempts !== undefined) set("attempts", input.attempts);
     if (input.nextAttemptAt !== undefined) set("next_attempt_at", input.nextAttemptAt);
     if (input.leaseUntil !== undefined) set("lease_until", input.leaseUntil);
+    if (input.leaseToken !== undefined) set("lease_token", input.leaseToken);
     if (input.lastError !== undefined) set("last_error", input.lastError);
     if (input.input !== undefined) set("input", JSON.stringify(input.input));
     setters.push("updated_at=now()");
-    const result = await this.db.query<IngestionJobRow>(`UPDATE ingestion_jobs SET ${setters.join(",")} WHERE scope_id=$1 AND id=$2 RETURNING ${ingestionJobFields}`, values);
-    if (!result.rows[0]) throw new Error("Ingestion job does not exist in this scope.");
+    if (input.expectedLeaseToken !== undefined) values.push(input.expectedLeaseToken);
+    const guard = input.expectedLeaseToken !== undefined ? ` AND status='processing' AND lease_until>now() AND lease_token=$${values.length}::uuid` : " AND status<>'processing'";
+    const result = await this.db.query<IngestionJobRow>(`UPDATE ingestion_jobs SET ${setters.join(",")} WHERE scope_id=$1 AND id=$2${guard} RETURNING ${ingestionJobFields}`, values);
+    if (!result.rows[0]) throw new Error("Ingestion job does not exist or its lease is no longer owned by this worker.");
+    return rowToIngestionJob(result.rows[0]);
+  }
+  async claim(input: { id: string; leaseMs?: number; scope?: PlanetScope }): Promise<IngestionJob> {
+    const result = await this.db.query<IngestionJobRow>(`UPDATE ingestion_jobs SET status='processing',attempts=attempts+1,lease_until=now()+($3 * interval '1 millisecond'),lease_token=gen_random_uuid(),updated_at=now() WHERE scope_id=$1 AND id=$2 AND attempts<max_attempts AND ((status IN ('queued','retry_wait') AND next_attempt_at<=now()) OR (status='processing' AND lease_until<=now())) RETURNING ${ingestionJobFields}`, [scopeId(input.scope), input.id, Math.max(1000, input.leaseMs ?? 60_000)]);
+    if (!result.rows[0]) throw new Error("Ingestion job is not available for claim.");
     return rowToIngestionJob(result.rows[0]);
   }
   async claimDue(input: { now?: Date; limit?: number; leaseMs?: number; scope?: PlanetScope }): Promise<IngestionJob[]> {
     const now = input.now ?? new Date(); const leaseUntil = new Date(now.getTime() + Math.max(1000, input.leaseMs ?? 60_000)); const currentScope = scopeId(input.scope);
-    await this.db.query("UPDATE ingestion_jobs SET status='failed',lease_until=NULL,last_error=COALESCE(last_error,'Retry limit exceeded.'),updated_at=$2 WHERE scope_id=$1 AND attempts>=max_attempts AND ((status='retry_wait' AND next_attempt_at<=$2) OR (status='processing' AND lease_until<=$2))", [currentScope, now]);
-    const result = await this.db.query<IngestionJobRow>(`WITH due AS (SELECT scope_id,id FROM ingestion_jobs WHERE scope_id=$1 AND attempts<max_attempts AND ((status IN ('queued','retry_wait') AND next_attempt_at<=$2) OR (status='processing' AND lease_until<=$2)) ORDER BY next_attempt_at,id LIMIT $3 FOR UPDATE SKIP LOCKED) UPDATE ingestion_jobs j SET status='processing',attempts=j.attempts+1,lease_until=$4,updated_at=$2 FROM due WHERE j.scope_id=due.scope_id AND j.id=due.id RETURNING ${[...ingestionJobFields.split(",")].map((field) => `j.${field}`).join(",")}`, [currentScope, now, Math.max(1, Math.min(input.limit ?? 10, 100)), leaseUntil]);
+    await this.db.query("UPDATE ingestion_jobs SET status='failed',lease_until=NULL,lease_token=NULL,last_error=COALESCE(last_error,'Retry limit exceeded.'),updated_at=$2 WHERE scope_id=$1 AND attempts>=max_attempts AND ((status='retry_wait' AND next_attempt_at<=$2) OR (status='processing' AND lease_until<=$2))", [currentScope, now]);
+    const result = await this.db.query<IngestionJobRow>(`WITH due AS (SELECT scope_id,id FROM ingestion_jobs WHERE scope_id=$1 AND attempts<max_attempts AND ((status IN ('queued','retry_wait') AND next_attempt_at<=$2) OR (status='processing' AND lease_until<=$2)) ORDER BY next_attempt_at,id LIMIT $3 FOR UPDATE SKIP LOCKED) UPDATE ingestion_jobs j SET status='processing',attempts=j.attempts+1,lease_until=$4,lease_token=gen_random_uuid(),updated_at=$2 FROM due WHERE j.scope_id=due.scope_id AND j.id=due.id RETURNING ${[...ingestionJobFields.split(",")].map((field) => `j.${field}`).join(",")}`, [currentScope, now, Math.max(1, Math.min(input.limit ?? 10, 100)), leaseUntil]);
     return result.rows.map(rowToIngestionJob);
   }
 }
@@ -234,9 +284,19 @@ export class PostgresIdentityStore implements IdentityStore {
   async get(input: { namespace: string; name: string; scope?: PlanetScope }): Promise<PlanetIdentity | null> { const row = await this.db.query<IdentityRow>(`SELECT id,namespace,name,metadata,created_at FROM ${this.identities} WHERE scope_id=$1 AND namespace=$2 AND name=$3`, [scopeId(input.scope), input.namespace, input.name]); return row.rows[0] ? rowToIdentity(row.rows[0]) : null; }
   async resolve(input: { namespace: string; name: string; scope?: PlanetScope }): Promise<PlanetIdentity | null> { const row = await this.db.query<IdentityRow>(`SELECT i.id,i.namespace,i.name,i.metadata,i.created_at FROM ${this.identities} i LEFT JOIN ${this.aliases} a ON a.identity_id=i.id AND a.scope_id=i.scope_id WHERE i.scope_id=$1 AND i.namespace=$2 AND (i.name=$3 OR a.alias=$3) ORDER BY (i.name=$3) DESC LIMIT 1`, [scopeId(input.scope), input.namespace, input.name]); return row.rows[0] ? rowToIdentity(row.rows[0]) : null; }
   async list(input: { namespace: string; limit?: number; scope?: PlanetScope }): Promise<PlanetIdentity[]> { const row = await this.db.query<IdentityRow>(`SELECT id,namespace,name,metadata,created_at FROM ${this.identities} WHERE scope_id=$1 AND namespace=$2 ORDER BY created_at,id LIMIT $3`, [scopeId(input.scope), input.namespace, Math.min(input.limit ?? 500, 100000)]); return row.rows.map(rowToIdentity); }
+  async listPage(input: { namespace: string; limit?: number; afterId?: string; scope?: PlanetScope }): Promise<{ items: PlanetIdentity[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const rows = (await this.db.query<IdentityRow>(`SELECT id,namespace,name,metadata,created_at FROM ${this.identities} WHERE scope_id=$1 AND namespace=$2 AND ($3::uuid IS NULL OR id>$3::uuid) ORDER BY id LIMIT $4`, [scopeId(input.scope), input.namespace, input.afterId ?? null, limit + 1])).rows;
+    return { items: rows.slice(0, limit).map(rowToIdentity), hasMore: rows.length > limit };
+  }
   async addAlias(input: { namespace: string; alias: string; identityId: string; scope?: PlanetScope }): Promise<void> { await this.db.query(`INSERT INTO ${this.aliases} (scope_id,namespace,alias,identity_id) SELECT $1,$2,$3,$4 WHERE EXISTS (SELECT 1 FROM ${this.identities} WHERE id=$4 AND scope_id=$1 AND namespace=$2)`, [scopeId(input.scope), input.namespace, input.alias, input.identityId]); }
   async bind(input: { identityId: string; providerId: string; resourceType: string; resourceId: string; metadata?: JsonObject; scope?: PlanetScope }): Promise<IdentityBinding> { const row = await this.db.query<BindingRow>(`INSERT INTO ${this.bindings} (scope_id,identity_id,provider_id,resource_type,resource_id,metadata) SELECT $1,$2,$3,$4,$5,$6::jsonb WHERE EXISTS (SELECT 1 FROM ${this.identities} WHERE id=$2 AND scope_id=$1) RETURNING identity_id,provider_id,resource_type,resource_id,metadata,created_at`, [scopeId(input.scope), input.identityId, input.providerId, input.resourceType, input.resourceId, JSON.stringify(input.metadata ?? {})]); if (!row.rows[0]) throw new Error("Identity must exist in this scope before it can be bound."); return rowToBinding(row.rows[0]); }
   async listBindings(input: { identityId: string; limit?: number; scope?: PlanetScope }): Promise<IdentityBinding[]> { const row = await this.db.query<BindingRow>(`SELECT identity_id,provider_id,resource_type,resource_id,metadata,created_at FROM ${this.bindings} WHERE scope_id=$1 AND identity_id=$2 ORDER BY created_at LIMIT $3`, [scopeId(input.scope), input.identityId, input.limit ?? 100]); return row.rows.map(rowToBinding); }
+  async listBindingsPage(input: { identityId: string; limit?: number; after?: { providerId: string; resourceType: string; resourceId: string }; scope?: PlanetScope }): Promise<{ items: IdentityBinding[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const rows = (await this.db.query<BindingRow>(`SELECT identity_id,provider_id,resource_type,resource_id,metadata,created_at FROM ${this.bindings} WHERE scope_id=$1 AND identity_id=$2 AND ($3::text IS NULL OR (provider_id,resource_type,resource_id)>($3,$4,$5)) ORDER BY provider_id,resource_type,resource_id LIMIT $6`, [scopeId(input.scope), input.identityId, input.after?.providerId ?? null, input.after?.resourceType ?? null, input.after?.resourceId ?? null, limit + 1])).rows;
+    return { items: rows.slice(0, limit).map(rowToBinding), hasMore: rows.length > limit };
+  }
 }
 const rowToIdentity = (row: IdentityRow): PlanetIdentity => ({ id: row.id, namespace: row.namespace, name: row.name, metadata: row.metadata ?? {}, createdAt: row.created_at });
 const rowToBinding = (row: BindingRow): IdentityBinding => ({ identityId: row.identity_id, providerId: row.provider_id, resourceType: row.resource_type, resourceId: row.resource_id, metadata: row.metadata ?? {}, createdAt: row.created_at });
@@ -282,7 +342,44 @@ export class PostgresSqlStore implements SqlStore {
     catch (error) { await connection.query("ROLLBACK").catch(() => undefined); throw error; } finally { connection.release(); }
   }
 }
-export function createPostgresProvider(input: { id?: string; database: PostgresDatabase; schema?: string; vectorCollections?: Record<string, VectorCollectionConfig> }): DataLayerProvider {
-  const schema = input.schema ?? "public"; identifier(schema); const observedDatabase = instrumentPostgresDatabase(input.database); const database = schemaDatabase(observedDatabase, schema);
-  return { id: input.id ?? "postgres", graph: new PostgresGraphStore(database), vector: new PgVectorStore(database, input.vectorCollections), vectorCollections: input.vectorCollections, documents: new PostgresDocumentStore(database), chunks: new PostgresDocumentChunkStore(database), evidence: new PostgresEvidenceStore(database), memories: new PostgresMemoryStore(database), ingestionJobs: new PostgresIngestionJobStore(database), identities: new PostgresIdentityStore(observedDatabase, schema), sql: new PostgresSqlStore(observedDatabase, schema) };
+
+const assertNamedStoreKey = (value: string, label: string) => { if (!value.trim()) throw new Error(`${label} cannot be empty.`); };
+const queueMessage = (row: { id: string; queue_name: string; payload: JsonValue; attempts: number; available_at: Date }): QueueMessage => ({ id: row.id, queue: row.queue_name, value: row.payload, attempts: row.attempts, availableAt: row.available_at });
+export class PostgresQueueStore implements QueueStore {
+  constructor(private readonly db: PostgresDatabase) {}
+  async enqueue(input: { queue: string; value: JsonValue; delayMs?: number; scope?: PlanetScope }): Promise<QueueMessage> {
+    assertNamedStoreKey(input.queue, "Queue name"); if (input.delayMs !== undefined && (!Number.isFinite(input.delayMs) || input.delayMs < 0)) throw new Error("Queue delayMs must be a non-negative number.");
+    const result = await this.db.query<{ id: string; queue_name: string; payload: JsonValue; attempts: number; available_at: Date }>("INSERT INTO queue_messages(id,scope_id,queue_name,payload,available_at) VALUES($1,$2,$3,$4::jsonb,now()+($5 * interval '1 millisecond')) RETURNING id,queue_name,payload,attempts,available_at", [randomUUID(), scopeId(input.scope), input.queue, JSON.stringify(input.value), input.delayMs ?? 0]); return queueMessage(result.rows[0]!);
+  }
+  async claim(input: { queue: string; limit?: number; leaseMs?: number; scope?: PlanetScope }): Promise<ClaimedQueueMessage[]> {
+    assertNamedStoreKey(input.queue, "Queue name"); const rawLimit = input.limit ?? 1; const rawLeaseMs = input.leaseMs ?? 60_000;
+    if (!Number.isFinite(rawLimit) || !Number.isFinite(rawLeaseMs)) throw new Error("Queue limit and leaseMs must be finite numbers.");
+    const limit = Math.max(1, Math.min(Math.floor(rawLimit), 100)); const leaseMs = Math.max(1000, Math.floor(rawLeaseMs));
+    const result = await this.db.query<{ id: string; queue_name: string; payload: JsonValue; attempts: number; available_at: Date; lease_token: string; lease_until: Date }>("WITH due AS (SELECT id FROM queue_messages WHERE scope_id=$1 AND queue_name=$2 AND available_at<=now() AND (status='ready' OR (status='leased' AND lease_until<=now())) ORDER BY available_at,id LIMIT $3 FOR UPDATE SKIP LOCKED), claimed AS (UPDATE queue_messages q SET status='leased',lease_until=now()+($4 * interval '1 millisecond'),lease_token=gen_random_uuid(),attempts=q.attempts+1 FROM due WHERE q.id=due.id RETURNING q.id,q.queue_name,q.payload,q.attempts,q.available_at,q.lease_token,q.lease_until) SELECT * FROM claimed ORDER BY available_at,id", [scopeId(input.scope), input.queue, limit, leaseMs]); return result.rows.map((row) => ({ ...queueMessage(row), leaseToken: row.lease_token, leaseUntil: row.lease_until }));
+  }
+  async ack(input: { queue: string; id: string; leaseToken: string; scope?: PlanetScope }): Promise<boolean> { const result = await this.db.query("DELETE FROM queue_messages WHERE scope_id=$1 AND queue_name=$2 AND id=$3 AND lease_token=$4::uuid AND status='leased' AND lease_until>now()", [scopeId(input.scope), input.queue, input.id, input.leaseToken]); return (result.rowCount ?? 0) > 0; }
+  async release(input: { queue: string; id: string; leaseToken: string; delayMs?: number; scope?: PlanetScope }): Promise<boolean> { const delay = input.delayMs ?? 0; if (!Number.isFinite(delay) || delay < 0) throw new Error("Queue delayMs must be a non-negative number."); const result = await this.db.query("UPDATE queue_messages SET status='ready',available_at=now()+($1 * interval '1 millisecond'),lease_until=NULL,lease_token=NULL WHERE scope_id=$2 AND queue_name=$3 AND id=$4 AND lease_token=$5::uuid AND status='leased' AND lease_until>now()", [delay, scopeId(input.scope), input.queue, input.id, input.leaseToken]); return (result.rowCount ?? 0) > 0; }
+}
+export class PostgresStackStore implements StackStore {
+  constructor(private readonly db: PostgresDatabase) {}
+  async push(input: { stack: string; value: JsonValue; scope?: PlanetScope }): Promise<void> { assertNamedStoreKey(input.stack, "Stack name"); await this.db.query("INSERT INTO stack_entries(scope_id,stack_name,value) VALUES($1,$2,$3::jsonb)", [scopeId(input.scope), input.stack, JSON.stringify(input.value)]); }
+  async pop(input: { stack: string; scope?: PlanetScope }): Promise<JsonValue | null> { assertNamedStoreKey(input.stack, "Stack name"); const result = await this.db.query<{ value: JsonValue }>("WITH top AS (SELECT id FROM stack_entries WHERE scope_id=$1 AND stack_name=$2 ORDER BY id DESC LIMIT 1 FOR UPDATE) DELETE FROM stack_entries s USING top WHERE s.id=top.id RETURNING s.value", [scopeId(input.scope), input.stack]); return result.rows[0]?.value ?? null; }
+  async peek(input: { stack: string; scope?: PlanetScope }): Promise<JsonValue | null> { assertNamedStoreKey(input.stack, "Stack name"); const result = await this.db.query<{ value: JsonValue }>("SELECT value FROM stack_entries WHERE scope_id=$1 AND stack_name=$2 ORDER BY id DESC LIMIT 1", [scopeId(input.scope), input.stack]); return result.rows[0]?.value ?? null; }
+  async size(input: { stack: string; scope?: PlanetScope }): Promise<number> { assertNamedStoreKey(input.stack, "Stack name"); const result = await this.db.query<{ count: string }>("SELECT count(*)::text AS count FROM stack_entries WHERE scope_id=$1 AND stack_name=$2", [scopeId(input.scope), input.stack]); return Number(result.rows[0]?.count ?? 0); }
+}
+export class PostgresKeyValueStore implements KeyValueStore {
+  constructor(private readonly db: PostgresDatabase) {}
+  async get(input: { namespace?: string; key: string; scope?: PlanetScope }): Promise<{ value: JsonValue; expiresAt?: Date } | null> { assertNamedStoreKey(input.key, "Key"); const result = await this.db.query<{ value: JsonValue; expires_at: Date | null }>("SELECT value,expires_at FROM key_values WHERE scope_id=$1 AND namespace=$2 AND key=$3 AND (expires_at IS NULL OR expires_at>now())", [scopeId(input.scope), input.namespace ?? "default", input.key]); const row = result.rows[0]; return row ? { value: row.value, expiresAt: row.expires_at ?? undefined } : null; }
+  async set(input: { namespace?: string; key: string; value: JsonValue; ttlMs?: number; scope?: PlanetScope }): Promise<void> { assertNamedStoreKey(input.key, "Key"); const ttl = input.ttlMs; if (ttl !== undefined && (!Number.isFinite(ttl) || ttl < 0)) throw new Error("Key/value ttlMs must be a non-negative number."); await this.db.query("INSERT INTO key_values(scope_id,namespace,key,value,expires_at) VALUES($1,$2,$3,$4::jsonb,CASE WHEN $5::double precision IS NULL THEN NULL ELSE now()+($5 * interval '1 millisecond') END) ON CONFLICT(scope_id,namespace,key) DO UPDATE SET value=EXCLUDED.value,expires_at=EXCLUDED.expires_at,updated_at=now()", [scopeId(input.scope), input.namespace ?? "default", input.key, JSON.stringify(input.value), ttl ?? null]); }
+  async delete(input: { namespace?: string; key: string; scope?: PlanetScope }): Promise<boolean> { assertNamedStoreKey(input.key, "Key"); const result = await this.db.query("DELETE FROM key_values WHERE scope_id=$1 AND namespace=$2 AND key=$3", [scopeId(input.scope), input.namespace ?? "default", input.key]); return (result.rowCount ?? 0) > 0; }
+}
+export function createPostgresProvider(input: { id?: string; database: PostgresDatabase; schema?: string; schemas?: import("@unknown-planet/core").ProviderSchemaMap; vectorCollections?: Record<string, VectorCollectionConfig> }): DataLayerProvider {
+  const defaultSchema = input.schema ?? "public";
+  const schemas = Object.fromEntries(Object.keys(featureTables).map((feature) => [feature, input.schemas?.[feature as PostgresSchemaFeature] ?? defaultSchema])) as Record<PostgresSchemaFeature, string>;
+  for (const schema of Object.values(schemas)) identifier(schema);
+  const relationalSchema = schemas.graph;
+  if ([schemas.documents, schemas.chunks, schemas.evidence].some((schema) => schema !== relationalSchema)) throw new Error("PostgreSQL graph, documents, chunks, and evidence must use the same schema because their tables have foreign-key relationships.");
+  const observedDatabase = instrumentPostgresDatabase(input.database);
+  const database = schemaDatabase(observedDatabase, schemas);
+  return { id: input.id ?? "postgres", graph: new PostgresGraphStore(database), vector: new PgVectorStore(database, input.vectorCollections), vectorCollections: input.vectorCollections, documents: new PostgresDocumentStore(database), chunks: new PostgresPagedDocumentChunkStore(database), evidence: new PostgresEvidenceStore(database), memories: new PostgresMemoryStore(database), ingestionJobs: new PostgresIngestionJobStore(database), identities: new PostgresIdentityStore(observedDatabase, schemas.identities), queue: new PostgresQueueStore(database), stack: new PostgresStackStore(database), keyValue: new PostgresKeyValueStore(database), sql: new PostgresSqlStore(observedDatabase, schemas.sql) };
 }

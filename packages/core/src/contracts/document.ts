@@ -29,6 +29,7 @@ export interface DocumentChunkStore {
   list(input: ScopedInput & { documentId: DocumentId; limit?: number }): Promise<DocumentChunk[]>;
   listPage?(input: ScopedInput & { documentId: DocumentId; limit?: number; afterId?: string }): Promise<{ items: DocumentChunk[]; hasMore: boolean }>;
   search(input: ScopedInput & { query: string; limit?: number }): Promise<DocumentChunk[]>;
+  searchPage?(input: ScopedInput & { query: string; limit?: number; afterId?: string }): Promise<{ items: DocumentChunk[]; hasMore: boolean }>;
   deleteExcept(input: ScopedInput & { documentId: DocumentId; keepIds: string[] }): Promise<number>;
 }
 

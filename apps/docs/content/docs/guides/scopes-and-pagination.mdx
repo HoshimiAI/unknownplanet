@@ -18,6 +18,8 @@ const docs = await requestPlanet.query({ text: 'current retention policy' });
 
 Do not allow clients to choose arbitrary tenant IDs unless the application explicitly authorizes that access. Every custom provider must honor the passed scope. SQL calls are a separate concern: authorization and safe parameterization remain application responsibilities.
 
+PostgreSQL and MongoDB encode tenant and workspace IDs into an unambiguous v2 key. Existing deployments must [migrate stored scope keys](/docs/operations#upgrade-existing-scope-keys) before deploying the new provider versions. Colon-bearing legacy keys require an explicit ownership mapping.
+
 The sample Elysia app maps bearer tokens from `API_KEYS` to scopes, or uses a single development scope from environment variables. Production startup requires API key configuration.
 
 ## Cursor pagination
@@ -33,7 +35,7 @@ do {
 } while (cursor);
 ```
 
-The SDK caps page limits (usually 500; memory search pages use the MemoryStore contract). Cursors are opaque; do not parse or construct them. A store must implement the relevant optional page method for native keyset pagination. Some facade page methods paginate a large fetched result set, so confirm the adapter behavior before using them for unbounded exports.
+The SDK caps page limits (usually 500; memory search pages use the MemoryStore contract). Cursors are opaque; do not parse or construct them. Graph, vector, and hybrid query pages preserve relevance order within their top 500 result window; they are intended for browsing search results, not exporting a whole corpus. Ranked page cursors detect a changed result order and ask the caller to restart. Other facade pages use provider-backed ID cursors rather than loading a large result set in the SDK; providers that do not implement the relevant page method report a capability error.
 
 Available SDK page methods include memory search, document chunk listing, graph search, query results, evidence lists, vector search, identity listing/bindings, and merge history. The sample HTTP API exposes selected `.../page` routes; inspect `/v1/openapi.json` for current schemas.
 

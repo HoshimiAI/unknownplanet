@@ -11,7 +11,9 @@ export interface IdentityStore {
   get(input: ScopedInput & { namespace: string; name: string }): Promise<PlanetIdentity | null>;
   resolve(input: ScopedInput & { namespace: string; name: string }): Promise<PlanetIdentity | null>;
   list(input: ScopedInput & { namespace: string; limit?: number }): Promise<PlanetIdentity[]>;
+  listPage?(input: ScopedInput & { namespace: string; limit?: number; afterId?: string }): Promise<{ items: PlanetIdentity[]; hasMore: boolean }>;
   addAlias(input: ScopedInput & { namespace: string; alias: string; identityId: IdentityId }): Promise<void>;
   bind(input: ScopedInput & { identityId: IdentityId; providerId: string; resourceType: string; resourceId: string; metadata?: JsonObject }): Promise<IdentityBinding>;
   listBindings(input: ScopedInput & { identityId: IdentityId; limit?: number }): Promise<IdentityBinding[]>;
+  listBindingsPage?(input: ScopedInput & { identityId: IdentityId; limit?: number; after?: { providerId: string; resourceType: string; resourceId: string } }): Promise<{ items: IdentityBinding[]; hasMore: boolean }>;
 }

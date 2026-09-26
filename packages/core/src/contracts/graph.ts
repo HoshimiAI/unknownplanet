@@ -68,6 +68,7 @@ export interface GraphStore {
   /** Atomically redirects incident edges/evidence, removes the duplicate, and records an audit entry. */
   mergeNodes?(input: ScopedInput & { sourceId: NodeId; targetId: NodeId }): Promise<NodeMergeRecord>;
   listMerges?(input: ScopedInput & { nodeId?: NodeId; limit?: number }): Promise<NodeMergeRecord[]>;
+  listMergesPage?(input: ScopedInput & { nodeId?: NodeId; limit?: number; afterSourceId?: string }): Promise<{ items: NodeMergeRecord[]; hasMore: boolean }>;
   createEdge(input: CreateEdgeInput): Promise<GraphEdge>;
   getEdge(id: EdgeId, scope?: PlanetScope): Promise<GraphEdge | null>;
   updateEdge(id: EdgeId, input: UpdateEdgeInput): Promise<GraphEdge | null>;

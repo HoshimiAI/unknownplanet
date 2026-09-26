@@ -1,0 +1,26 @@
+---
+title: Queues, stacks, and key/value storage
+description: Use scoped persistent storage primitives through the Planet SDK.
+---
+
+The SDK exposes three optional scoped capabilities. PostgreSQL and MongoDB providers implement them; custom providers can implement the contracts in `@unknown-planet/core`.
+
+```ts
+const scoped = planet.withScope({ tenantId: 'acme' });
+
+await scoped.kv.set({ namespace: 'sessions', key: 'session-42', value: { userId: 'u-7' }, ttlMs: 60_000 });
+const session = await scoped.kv.get({ namespace: 'sessions', key: 'session-42' });
+
+await scoped.stack.push({ stack: 'undo', value: { action: 'rename', id: 'node-7' } });
+const lastAction = await scoped.stack.pop('undo');
+
+const message = await scoped.queue.send({ queue: 'document-jobs', value: { documentId: 'doc-42' } });
+const [claimed] = await scoped.queue.claim({ queue: 'document-jobs', limit: 10, leaseMs: 30_000 });
+if (claimed) await scoped.queue.ack({ queue: 'document-jobs', id: claimed.id, leaseToken: claimed.leaseToken });
+```
+
+Queues return leased messages with a `leaseToken`. Pass that token to `ack` or `release`; a worker holding an expired claim cannot complete a later worker's claim. Unacknowledged messages become claimable after their lease expires. Claims increment the message's `attempts` count. The SDK does not impose retry limits or dead-letter policy.
+
+Stacks are LIFO and support JSON values. Key/value entries are JSON values keyed by namespace and key; `ttlMs` is optional and `get` returns `{ value, expiresAt }` or `null` when the entry is absent or expired. All operations receive the current Planet scope, so providers must isolate tenant and workspace data.
+
+Include Planet's required storage SQL (including `010_queue_stack_key_value.sql` and `011_queue_claim_tokens.sql`) in your application's PostgreSQL migration history and apply it with your normal release migration step. For MongoDB, create required collections and compound/expiry indexes through your application's MongoDB migration step. Planet performs queue, stack, and key/value operations after the provider is configured; it does not decide when production database structure changes are applied.

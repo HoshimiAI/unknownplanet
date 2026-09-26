@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { Pool } from "pg";
-import { PgVectorStore, PostgresDocumentChunkStore, PostgresDocumentStore, PostgresEvidenceStore, PostgresGraphStore, PostgresIdentityStore, PostgresIngestionJobStore, PostgresMemoryStore } from "../dist/index.js";
+import { createPostgresProvider, PgVectorStore, PostgresDocumentChunkStore, PostgresDocumentStore, PostgresEvidenceStore, PostgresGraphStore, PostgresIdentityStore, PostgresIngestionJobStore, PostgresMemoryStore } from "../dist/index.js";
 
 const connectionString = process.env.UP_TEST_DATABASE_URL;
 const pool = connectionString ? new Pool({ connectionString }) : undefined;
@@ -96,6 +96,38 @@ if (pool) test("PostgreSQL durably schedules and atomically claims ingestion ret
     expect(retry).toMatchObject({ id, status: "processing", attempts: 2, checkpoint: "chunks_saved" });
     expect(retry.lastError).toBe("temporary");
   } finally { await pool.query("DELETE FROM ingestion_jobs WHERE scope_id=$1", [scope.tenantId]); }
+});
+
+if (pool) test("PostgreSQL live queue, stack, key/value, and SQL operations", async () => {
+  const scope = { tenantId: `primitives-${randomUUID()}` };
+  const provider = createPostgresProvider({ database: pool });
+  const queueName = `live-${randomUUID()}`;
+  const stackName = `live-${randomUUID()}`;
+  const key = `live-${randomUUID()}`;
+  try {
+    const sent = await provider.queue.enqueue({ queue: queueName, value: { action: "index" }, scope });
+    const [claimed] = await provider.queue.claim({ queue: queueName, leaseMs: 5000, scope });
+    expect(claimed).toMatchObject({ id: sent.id, value: { action: "index" }, attempts: 1 });
+    expect(await provider.queue.release({ queue: queueName, id: sent.id, leaseToken: claimed.leaseToken, scope })).toBe(true);
+    const [retry] = await provider.queue.claim({ queue: queueName, leaseMs: 5000, scope });
+    expect(retry).toMatchObject({ id: sent.id, attempts: 2 });
+    expect(await provider.queue.ack({ queue: queueName, id: sent.id, leaseToken: retry.leaseToken, scope })).toBe(true);
+
+    await provider.stack.push({ stack: stackName, value: { action: "undo" }, scope });
+    expect(await provider.stack.size({ stack: stackName, scope })).toBe(1);
+    expect(await provider.stack.peek({ stack: stackName, scope })).toEqual({ action: "undo" });
+    expect(await provider.stack.pop({ stack: stackName, scope })).toEqual({ action: "undo" });
+
+    await provider.keyValue.set({ namespace: "integration", key, value: { enabled: true }, ttlMs: 60_000, scope });
+    expect(await provider.keyValue.get({ namespace: "integration", key, scope })).toMatchObject({ value: { enabled: true }, expiresAt: expect.any(Date) });
+    expect(await provider.keyValue.delete({ namespace: "integration", key, scope })).toBe(true);
+    expect((await provider.sql.query({ text: "SELECT current_schema() AS schema" })).rows[0]?.schema).toBe("public");
+    expect((await provider.sql.transaction((tx) => tx.query({ text: "SELECT $1::text AS value", values: ["live"] }))).rows[0]?.value).toBe("live");
+  } finally {
+    await pool.query("DELETE FROM queue_messages WHERE scope_id=$1", [scope.tenantId]);
+    await pool.query("DELETE FROM stack_entries WHERE scope_id=$1", [scope.tenantId]);
+    await pool.query("DELETE FROM key_values WHERE scope_id=$1", [scope.tenantId]);
+  }
 });
 
 afterAll(async () => { await pool?.end(); });

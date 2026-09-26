@@ -1,11 +1,13 @@
 ---
 title: Providers
-description: Configure PostgreSQL, MongoDB, and application-defined storage providers.
+description: Configure PostgreSQL, MongoDB, Redis, SQLite, Neo4j, Qdrant, and MinIO providers.
 ---
+
+Provider factories accept an optional `schemas` map keyed by capability. Values are interpreted as provider-native namespaces: PostgreSQL schema names, collection/table/label prefixes, Redis key prefixes, Qdrant collection prefixes, or MinIO object key prefixes. This map routes Planet capabilities; it does not migrate application-owned database structure. A provider ignores capabilities it does not implement. Existing provider-specific options supply defaults; a configured map entry overrides the default namespace.
 
 ## PostgreSQL and pgvector
 
-Install `@unknown-planet/postgres` and its `pg` peer dependency. `createPostgresProvider` creates stores for graph, vectors, documents, chunks, evidence, memories, ingestion jobs, identities, and SQL. Its vector collections can declare expected dimensions and model names.
+Install `@unknown-planet/postgres` and its `pg` peer dependency. `createPostgresProvider` creates stores for graph, vectors, documents, chunks, evidence, memories, ingestion jobs, identities, queues, stacks, key/value data, and SQL. Its vector collections can declare expected dimensions and model names.
 
 ```ts
 import { Pool } from 'pg';
@@ -19,11 +21,107 @@ const postgres = createPostgresProvider({
 });
 ```
 
-The database needs the pgvector extension and the ordered migrations under `packages/postgres/migrations`. Set the same schema for migration and provider configuration.
+The database needs the pgvector extension and Planet's storage tables. Keep the migration history and rollout in your application deployment, and apply the SQL with the migration tool your application already uses. The SQL files under `packages/postgres/migrations` define Planet's built-in storage tables; they do not manage your application tables. Set the same schema for those tables and provider configuration.
+
+To isolate capabilities into separate schemas, pass a `schemas` map. Graph, documents, chunks, and evidence share a schema to preserve their foreign-key relationships; other PostgreSQL capabilities, including raw SQL's search path, can use separate schemas. Run migrations for every schema with `PLANET_SCHEMAS` (comma-separated); each schema gets its own migration history and the complete set of Planet tables.
+
+```ts
+const postgres = createPostgresProvider({
+  database: pool,
+  schema: 'public', // fallback for capabilities not listed below
+  schemas: {
+    graph: 'knowledge',
+    documents: 'knowledge',
+    chunks: 'knowledge',
+    evidence: 'knowledge',
+    memories: 'agent_memory',
+    vector: 'embeddings',
+    identities: 'identity_catalog',
+    queue: 'jobs',
+    stack: 'jobs',
+    keyValue: 'jobs',
+    sql: 'reporting',
+  },
+});
+```
+
+```sh
+PLANET_SCHEMAS=public,knowledge,agent_memory,embeddings,identity_catalog,jobs,reporting bun run --cwd packages/postgres migrate
+```
 
 ## MongoDB and Atlas Vector Search
 
-`@unknown-planet/mongodb` provides graph, vector, document, chunk, evidence, memory, and ingestion job stores. MongoDB transactions require a replica set. Call `initializeMongoIndexes(database)` during startup. Atlas Vector Search index creation remains an Atlas configuration step; a local MongoDB instance does not by itself supply that managed index.
+`@unknown-planet/mongodb` provides graph, vector, document, chunk, evidence, memory, ingestion job, queue, stack, and key/value stores. MongoDB transactions require a replica set. Create and evolve collections and indexes in your application's deployment migrations using the MongoDB driver or your chosen migration tool. Atlas Vector Search index creation belongs in Atlas configuration; a local MongoDB instance does not by itself supply that managed index.
+
+For application-owned collections, pass `customCollections: ['app_notes']` to `createMongoProvider`. This adds the `collections` capability for `planet.custom.collection` and permits only registered names. The application still creates its collections and indexes. See [Custom application data](/docs/guides/custom-data).
+
+## Redis
+
+Install `@unknown-planet/redis` and `redis` in your application. `createRedisProvider({ client })` accepts a connected node-redis client and provides scoped queue, stack, and key/value stores. Queue send/claim/ack/release operations use atomic Redis scripts; stack operations use Redis lists, and key/value entries support expiry.
+
+```ts
+import { createClient } from 'redis';
+import { createRedisProvider } from '@unknown-planet/redis';
+
+const client = createClient({ url: process.env.REDIS_URL });
+await client.connect();
+const redis = createRedisProvider({ client, schemas: { queue: 'jobs_v2', stack: 'undo_v2', keyValue: 'sessions_v2' } });
+```
+
+## SQLite
+
+`@unknown-planet/sqlite` provides graph and evidence stores using `better-sqlite3`. Install both packages in the application and pass an open database. The current adapter ensures its internal tables exist when constructed; this is bootstrap behavior for Planet's built-in store and does not manage application-owned tables. SQLite is useful for embedded deployments and single-host applications; use a network database when multiple application hosts need concurrent writes.
+
+```ts
+import Database from 'better-sqlite3';
+import { createSQLiteProvider } from '@unknown-planet/sqlite';
+
+const database = new Database(process.env.PLANET_SQLITE_PATH ?? './planet.db');
+const sqlite = createSQLiteProvider({ database, schemas: { graph: 'knowledge', evidence: 'sources' } });
+```
+
+## Neo4j
+
+`@unknown-planet/neo4j` provides graph and evidence stores backed by Neo4j. Install `neo4j-driver`, create a driver, and apply constraints or indexes in your application's Neo4j migration using Cypher. Then pass the connected driver to the provider. The example shows application-owned DDL for the labels used by the configured provider namespaces.
+
+```ts
+import neo4j from 'neo4j-driver';
+import { createNeo4jProvider } from '@unknown-planet/neo4j';
+
+const driver = neo4j.driver(process.env.NEO4J_URI!, neo4j.auth.basic(process.env.NEO4J_USER!, process.env.NEO4J_PASSWORD!));
+const schemas = { graph: 'knowledge', evidence: 'sources' };
+const session = driver.session({ database: process.env.NEO4J_DATABASE });
+try {
+  // Keep this Cypher in your application's versioned migration.
+  await session.run('CREATE CONSTRAINT knowledge_up_node_scope_id IF NOT EXISTS FOR (n:knowledge_UPNode) REQUIRE (n.scopeId, n.id) IS UNIQUE');
+  await session.run('CREATE INDEX knowledge_up_edge_scope_id IF NOT EXISTS FOR ()-[r:knowledge_UP_EDGE]-() ON (r.scopeId, r.id)');
+  await session.run('CREATE INDEX sources_up_evidence_scope_id IF NOT EXISTS FOR (e:sources_UPEvidence) ON (e.scopeId, e.id)');
+} finally {
+  await session.close();
+}
+const neo4jProvider = createNeo4jProvider({ driver, database: process.env.NEO4J_DATABASE, schemas });
+```
+
+## Qdrant
+
+`@unknown-planet/qdrant` provides scoped vector storage. Configure a Qdrant collection for each vector namespace and initialize collections before serving requests. Pass the same `schemas` map to initialization and provider construction. Collection dimensions are fixed; changing them requires a new collection and reindexing.
+
+```ts
+import { QdrantClient } from '@qdrant/js-client-rest';
+import { createQdrantProvider, initializeQdrantCollections } from '@unknown-planet/qdrant';
+
+const client = new QdrantClient({ url: process.env.QDRANT_URL!, apiKey: process.env.QDRANT_API_KEY });
+const collections = { node: { collection: 'planet_nodes', dimensions: 1536, model: 'text-embedding-3-small' } };
+const schemas = { vector: 'tenant_v2' };
+await initializeQdrantCollections(client, collections, schemas);
+const qdrantProvider = createQdrantProvider({ client, collections, schemas });
+```
+
+## MinIO blob storage
+
+Install `@unknown-planet/minio` and `@aws-sdk/client-s3`. Configure an S3 client with MinIO's endpoint, credentials, and `forcePathStyle: true`, then register `createMinioProvider({ client, bucket, schemas: { blobs: 'tenant-artifacts' } })` and route `blobs` to its provider ID. The map value prefixes object keys; returned `s3://bucket/key` URIs include that prefix and remain reversible. Compose exposes MinIO at `http://localhost:9000` and creates the `unknownplanet-artifacts` bucket. The application owns authorization and deciding when stored source bytes may be fetched.
+
+Route capabilities independently to combine providers. For example, Neo4j can own the graph while Qdrant owns vectors and SQLite stores local evidence.
 
 ## Mix providers
 
@@ -40,4 +138,8 @@ Implement the relevant contracts from `@unknown-planet/core` and register a `Dat
 | Graph, documents, chunks, evidence, memories, ingestion jobs | Yes | Yes | Run the corresponding migrations or initialize indexes. |
 | Vector search | pgvector | Atlas Vector Search | Enable pgvector or create the Atlas search index. |
 | Identities and SQL | Yes | No built-in implementation | Route to a compatible custom provider if needed. |
-| Blob storage | No | No | Supply an application-specific adapter. |
+| Custom collections | Via SQL | Yes, for registered names | Migrate application structure separately; route MongoDB with `routing.collections`. |
+| Queues, stacks, key/value | Yes | Yes | Redis adapter available in `@unknown-planet/redis`; apply PostgreSQL migration 010 or initialize MongoDB indexes. |
+| Blob storage | No | No | Use the MinIO adapter or supply another BlobStorageAdapter. |
+
+SQLite supports graph and evidence. Neo4j supports graph and evidence. Qdrant supports vectors. Redis supports queues, stacks, and key/value data. Register the adapters and route only the capabilities you want each one to serve.

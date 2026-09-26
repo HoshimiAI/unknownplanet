@@ -23,7 +23,7 @@ for (const result of results) {
 }
 ```
 
-If `search` is omitted, keyword, vector, and graph options default to enabled. Semantic paths require embeddings and vector storage. Chunk vector search additionally requires a vector route and chunk store. Keyword and semantic paths run concurrently; results are fused by node ID and sorted deterministically before the result limit.
+If `search` is omitted, keyword, vector, and graph options default to enabled. Configured graph and chunk routes contribute independently, so a deployment with only document chunks can still use keyword retrieval. Semantic paths require embeddings and vector storage. Chunk vector search additionally requires a vector route and chunk store. Keyword and semantic paths run concurrently; results are fused by node ID and sorted deterministically before the result limit.
 
 ## Filters and expansion
 
@@ -39,4 +39,4 @@ Available filters include `nodeType`, metadata, `agentId`, and `documentId`. Rel
 
 `planet.query` returns graph/document knowledge results; use `planet.memory.search` for owner-filtered memory records. The `agentId` query filter restricts memory nodes in hybrid query, but should not replace explicit user/session filters and authorization in a personalized-memory workflow.
 
-The Elysia API exposes `/v1/query` and `/v1/query/page`; SDK users can use `queryPage` for cursors.
+The Elysia API exposes `/v1/query` and `/v1/query/page`; SDK users can use `queryPage` for cursors. Pages preserve ranking within the top 500 results returned by the configured providers.

@@ -1,0 +1,25 @@
+{
+  "name": "@unknown-planet/redis",
+  "version": "0.1.0",
+  "description": "Redis queue, stack, and key/value adapters for Unknown Planet.",
+  "license": "Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/HoshimiAI/unknownplanet.git", "directory": "packages/redis" },
+  "publishConfig": { "access": "public" },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "clean": "tsc --build --clean tsconfig.build.json",
+    "dev": "tsc --project tsconfig.build.json --watch",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "test": "bun test test",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": { "@unknown-planet/core": "workspace:*" },
+  "devDependencies": { "redis": "^5.12.1" },
+  "peerDependencies": { "redis": ">=4 <6" },
+  "peerDependenciesMeta": { "redis": { "optional": true } }
+}

@@ -16,6 +16,13 @@ services:
       - ./packages/postgres/migrations/005_entity_merge_history.sql:/docker-entrypoint-initdb.d/005_entity_merge_history.sql:ro
       - ./packages/postgres/migrations/006_merge_snapshots.sql:/docker-entrypoint-initdb.d/006_merge_snapshots.sql:ro
       - ./packages/postgres/migrations/007_ingestion_jobs.sql:/docker-entrypoint-initdb.d/007_ingestion_jobs.sql:ro
+      - ./packages/postgres/migrations/008_memory_ingestion_jobs.sql:/docker-entrypoint-initdb.d/008_memory_ingestion_jobs.sql:ro
+      - ./packages/postgres/migrations/009_vector_dimensions.sql:/docker-entrypoint-initdb.d/009_vector_dimensions.sql:ro
+      - ./packages/postgres/migrations/010_queue_stack_key_value.sql:/docker-entrypoint-initdb.d/010_queue_stack_key_value.sql:ro
+      - ./packages/postgres/migrations/011_queue_claim_tokens.sql:/docker-entrypoint-initdb.d/011_queue_claim_tokens.sql:ro
+      - ./packages/postgres/migrations/012_ingestion_lease_tokens.sql:/docker-entrypoint-initdb.d/012_ingestion_lease_tokens.sql:ro
+      - ./packages/postgres/migrations/013_scope_key_map.sql:/docker-entrypoint-initdb.d/013_scope_key_map.sql:ro
+      - ./packages/postgres/migrations/014_scope_keys.sql:/docker-entrypoint-initdb.d/014_scope_keys.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U unknownplanet -d unknownplanet"]
       interval: 5s
@@ -33,7 +40,65 @@ services:
       interval: 5s
       timeout: 5s
       retries: 20
+  neo4j:
+    image: neo4j:5
+    environment:
+      NEO4J_AUTH: neo4j/unknownplanet
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - unknownplanet-neo4j:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p unknownplanet 'RETURN 1' >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - unknownplanet-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  qdrant:
+    image: qdrant/qdrant:v1.13.6
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - unknownplanet-qdrant:/qdrant/storage
+  minio:
+    image: derklaro/minio:RELEASE.2025-10-15T17-29-55Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: unknownplanet
+      MINIO_ROOT_PASSWORD: unknownplanet
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - unknownplanet-minio:/data
+  minio-init:
+    image: amazon/aws-cli:2.27.41
+    depends_on:
+      minio:
+        condition: service_started
+    environment:
+      AWS_ACCESS_KEY_ID: unknownplanet
+      AWS_SECRET_ACCESS_KEY: unknownplanet
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["until aws --endpoint-url http://minio:9000 s3api list-buckets >/dev/null 2>&1; do sleep 1; done; aws --endpoint-url http://minio:9000 s3api head-bucket --bucket unknownplanet-artifacts >/dev/null 2>&1 || aws --endpoint-url http://minio:9000 s3api create-bucket --bucket unknownplanet-artifacts"]
 
 volumes:
   unknownplanet-postgres:
   unknownplanet-mongodb:
+  unknownplanet-neo4j:
+  unknownplanet-redis:
+  unknownplanet-qdrant:
+  unknownplanet-minio:

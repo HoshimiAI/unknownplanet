@@ -27,6 +27,21 @@ test("missing capabilities raise a stable typed SDK error", async () => {
   await expect(planet.memory.search({})).rejects.toMatchObject({ code: "capability_unavailable", statusCode: 503 });
 });
 
+test("routes blob put, get, and delete through the configured provider", async () => {
+  const calls = [];
+  const blobs = {
+    put: async (input) => { calls.push(["put", input]); return { uri: "s3://artifacts/report.pdf" }; },
+    get: async (uri) => { calls.push(["get", uri]); return new Uint8Array([1, 2]); },
+    delete: async (uri) => { calls.push(["delete", uri]); },
+  };
+  const planet = new Planet({ providers: [{ id: "minio", blobs }], routing: { blobs: "minio" } });
+  const data = new Uint8Array([1, 2]);
+  const { uri } = await planet.blob.put({ key: "report.pdf", data, contentType: "application/pdf" });
+  expect(await planet.blob.get(uri)).toEqual(data);
+  await planet.blob.delete(uri);
+  expect(calls).toEqual([["put", { key: "report.pdf", data, contentType: "application/pdf" }], ["get", uri], ["delete", uri]]);
+});
+
 test("memory ingestion fails clearly without Planet-owned embeddings", async () => {
   const planet = new Planet({ memories: { add: async () => { throw new Error("should not persist"); }, get: async () => null, search: async () => [], delete: async () => false } });
   await expect(planet.memory.add({ agentId: "agent", content: "requires semantic indexing" })).rejects.toBeInstanceOf(PlanetEmbeddingNotConfiguredError);
@@ -77,6 +92,42 @@ test("routes package-defined extensions without changing the SDK", () => {
   });
   const cache = planet.extension("cache");
   expect(cache.get("node-1")).toBe("cache:node-1");
+});
+
+test("emits awaited metadata-only lifecycle hooks and inherits them on scoped clients", async () => {
+  const events = [];
+  const planet = new Planet({
+    graph: { getNode: async () => null },
+    hooks: [async (event) => { await Promise.resolve(); events.push(event); }],
+  }).withScope({ tenantId: "acme" });
+
+  expect(await planet.graph.node.get("node-1")).toBeNull();
+  expect(events.map(({ operation, phase }) => [operation, phase])).toEqual([
+    ["graph.node.get", "started"],
+    ["graph.node.get", "completed"],
+  ]);
+  expect(events[1]).toEqual(expect.objectContaining({ operation: "graph.node.get", phase: "completed" }));
+  expect(events[1].durationMs).toEqual(expect.any(Number));
+  expect(events[1]).not.toHaveProperty("scope");
+  expect(events[1]).not.toHaveProperty("input");
+  expect(events[1]).not.toHaveProperty("result");
+});
+
+test("reports operation failures and ignores hook failures", async () => {
+  const events = [];
+  const planet = new Planet({
+    graph: { getNode: async () => { throw new Error("store unavailable"); } },
+    hooks: [async (event) => { events.push(event); throw new Error("observer failed"); }],
+  });
+
+  await expect(planet.graph.node.get("node-1")).rejects.toThrow("store unavailable");
+  expect(events.map(({ phase }) => phase)).toEqual(["started", "failed"]);
+  expect(events[1]).toEqual(expect.objectContaining({
+    operation: "graph.node.get",
+    phase: "failed",
+    error: { name: "PlanetProviderError", code: "provider_error" },
+  }));
+  expect(events[1].error).not.toHaveProperty("message");
 });
 
 test("forwards vector writes, deletes, and SQL transactions", async () => {

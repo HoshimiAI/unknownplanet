@@ -1,8 +1,15 @@
 import type {
-  BlobStorageAdapter, DataLayerProvider, DocumentChunkStore, DocumentParser, DocumentStore, EmbeddingProvider, EntityExtractor,
+  BlobStorageAdapter, CollectionStore, DataLayerProvider, DocumentChunkStore, DocumentParser, DocumentStore, EmbeddingProvider, EntityExtractor,
   Evidence, EvidenceStore, GraphEdge, GraphNode, GraphStore, IdentityStore, IngestionJobStore, MemoryStore, PlanetScope,
-  ProviderCapability, ProviderRouting, ProviderRoutingPolicy, SqlStore, VectorCollectionConfig, VectorStore,
+  PlanetJsonSchema, ProviderCapability, ProviderOperation, ProviderRouting, ProviderRoutingPolicy, QueueStore, StackStore, KeyValueStore, SqlStore, VectorCollectionConfig, VectorStore,
 } from "@unknown-planet/core";
+
+export type CustomDataKind = "graph.node" | "graph.edge" | "vector" | "document" | "chunk" | "evidence" | "memory" | "identity" | "identity.binding" | "ingestionJob" | "queue" | "stack" | "keyValue" | "blob";
+
+/** A graph schema can target every node/edge or a specific node type/edge relation. */
+export type CustomSchemaKey = CustomDataKind | `graph.node:${string}` | `graph.edge:${string}`;
+/** Optional JSON Schema definitions for application data stored with Planet records. */
+export type CustomSchemas = Partial<Record<CustomSchemaKey, PlanetJsonSchema>>;
 
 export interface ProviderSelectionInput {
   capability: ProviderCapability;
@@ -11,6 +18,15 @@ export interface ProviderSelectionInput {
 
 /** Selects a provider when no explicit routing rule exists. */
 export type ProviderSelector = (input: ProviderSelectionInput) => string | undefined;
+
+export interface FeaturePolicyInput {
+  capability: ProviderCapability;
+  operation: ProviderOperation;
+  scope: PlanetScope;
+}
+
+/** Returns false to deny an SDK capability operation for the current scope. */
+export type FeaturePolicy = (input: FeaturePolicyInput) => boolean;
 
 export interface RetrievalConfig {
   /** Namespace containing graph-node vectors. Defaults to `node`. */
@@ -27,6 +43,18 @@ export interface RetrievalConfig {
 
 export type PlanetQueryRanker = (input: { query: string; results: PlanetQueryResult[] }) => PlanetQueryResult[] | Promise<PlanetQueryResult[]>;
 
+export interface PlanetHookEvent {
+  /** Public SDK operation, such as `graph.node.create` or `query`. */
+  operation: string;
+  phase: "started" | "completed" | "failed";
+  /** Elapsed time for completed and failed operations. */
+  durationMs?: number;
+  /** Error summary for failed operations. */
+  error?: { name: string; code?: string };
+}
+
+export type PlanetHook = (event: PlanetHookEvent) => void | Promise<void>;
+
 export interface EntityResolutionConfig { fuzzyThreshold?: number; embeddingThreshold?: number }
 
 export interface PlanetConfig {
@@ -38,8 +66,14 @@ export interface PlanetConfig {
   selectProvider?: ProviderSelector;
   /** Operation-aware policy for tenancy, read/write roles, replicas, and failover. */
   routingPolicy?: ProviderRoutingPolicy;
+  /** Optional scope-aware SDK feature gate. Omitted capabilities remain enabled. */
+  featurePolicy?: FeaturePolicy;
   /** Scope injected into all Planet domain calls. Defaults to the isolated `default` scope. */
   scope?: PlanetScope;
+  /** Optional JSON validation for Planet record fields. Does not migrate databases. */
+  validationSchemas?: CustomSchemas;
+  /** @deprecated Use validationSchemas. This validates JSON values; it does not manage physical schemas. */
+  customSchemas?: CustomSchemas;
   /** Direct adapters remain supported for a single-provider setup. */
   graph?: GraphStore;
   vector?: VectorStore;
@@ -50,8 +84,12 @@ export interface PlanetConfig {
   memories?: MemoryStore;
   ingestionJobs?: IngestionJobStore;
   identities?: IdentityStore;
+  queue?: QueueStore;
+  stack?: StackStore;
+  keyValue?: KeyValueStore;
   blobs?: BlobStorageAdapter;
   sql?: SqlStore;
+  collections?: CollectionStore;
   /** Application- or package-defined capabilities for the inline provider. */
   extensions?: Record<string, unknown>;
   embeddings?: EmbeddingProvider;
@@ -61,11 +99,15 @@ export interface PlanetConfig {
   retrieval?: RetrievalConfig;
   /** Optional application policy applied to fused results before the result limit. */
   queryRanker?: PlanetQueryRanker;
+  /** Observes public SDK operation lifecycle events. Hook failures are ignored. */
+  hooks?: readonly PlanetHook[];
 }
 
 export interface GraphSearchInput {
   query: string;
   semantic?: boolean;
+  /** Skip edge/evidence hydration when using graph search only for candidate discovery. */
+  includeContext?: boolean;
   limit?: number;
   graph?: { depth?: number };
   /** Override the configured vector namespace for this query. */

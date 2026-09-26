@@ -1,9 +1,11 @@
 ---
 title: Unknown Planet
-description: A storage-neutral data layer for graph, vector, memory, and document retrieval.
+description: An AI-native database orchestrator for storage routing and knowledge workflows.
 ---
 
-Unknown Planet gives an application one TypeScript client for scoped knowledge storage and retrieval. It routes each capability to a provider, so a deployment can combine relational, document, vector, and blob systems behind one API.
+Unknown Planet gives an application one TypeScript client for AI-native data workflows. It routes graph, vector, document, memory, evidence, blob, SQL, and operational storage capabilities to providers, so a deployment can combine databases behind one API while keeping each provider's native strengths.
+
+The core workflow is **ingest → retrieve → cite**: ingest source material, retrieve relevant graph and vector results, then return evidence linked to the source. Planet coordinates those steps and routes each operation; the application owns database migrations, indexes, constraints, authorization, and source access policy. Start with [document ingestion](/docs/guides/document-ingestion), [hybrid retrieval](/docs/guides/hybrid-retrieval), and [evidence and time](/docs/guides/evidence-and-time).
 
 <Cards>
   <Card title="Quickstart" href="/docs/quickstart" description="Run the API locally and make your first request." />
@@ -21,5 +23,10 @@ Unknown Planet gives an application one TypeScript client for scoped knowledge s
 | `@unknown-planet/sdk` | `Planet` client, routing, ingestion, and retrieval. |
 | `@unknown-planet/postgres` | PostgreSQL stores, including pgvector support and migrations. |
 | `@unknown-planet/mongodb` | MongoDB stores and Atlas Vector Search adapter. |
+| `@unknown-planet/redis` | Queue, stack, and key/value stores. |
+| `@unknown-planet/sqlite` | Embedded graph and evidence stores. |
+| `@unknown-planet/neo4j` | Graph and evidence stores. |
+| `@unknown-planet/qdrant` | Vector store. |
+| `@unknown-planet/minio` | S3-compatible blob store. |
 
-Unknown Planet orchestrates providers; it is not a database engine or ORM. Applications own their database infrastructure, credentials, and deployment policy.
+Unknown Planet orchestrates providers and composes AI data workflows. Applications own their database infrastructure, credentials, and deployment policy. Provider routes remain explicit; Unknown Planet does not replicate data between databases.

@@ -14,8 +14,14 @@ export interface GraphSearchContext {
 export async function searchGraph(input: GraphSearchInput, context: GraphSearchContext): Promise<GraphSearchResult[]> {
   const limit = input.limit ?? 20;
   if (!input.semantic) {
-    const nodes = await context.requireGraph("search").searchNodes({ query: input.query, limit, scope: context.scope });
-    return nodes.map((item) => ({ node: item, score: 1, evidence: [], edges: [] }));
+    const graph = context.requireGraph("search");
+    const nodes = await graph.searchNodes({ query: input.query, limit, scope: context.scope });
+    if (!nodes.length) return [];
+    if (input.includeContext === false) return nodes.map((node) => ({ node, score: 1, evidence: [], edges: [] }));
+    const edgeLists = await Promise.all(nodes.map((node) => graph.neighbors({ nodeId: node.id, direction: "both", limit: 1000, scope: context.scope, asOf: input.asOf })));
+    const edgeIds = [...new Set(edgeLists.flat().map((edge) => edge.id))];
+    const evidence = edgeIds.length ? await context.resolveEvidence("read")?.list({ edgeIds, limit: Math.max(limit * 20, edgeIds.length), scope: context.scope }) ?? [] : [];
+    return nodes.map((node, index) => ({ node, score: 1, edges: edgeLists[index]!, evidence: evidence.filter((item) => edgeLists[index]!.some((edge) => edge.id === item.edgeId)) }));
   }
   const embedding = await context.embed(input.query, input.vectorNamespace ?? context.retrieval.nodeNamespace ?? "node");
   const candidates = await context.requireVector("search").search({

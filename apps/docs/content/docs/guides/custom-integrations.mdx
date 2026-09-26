@@ -14,7 +14,7 @@ const searchClient = planet.withProviders([qdrantProvider], {
 });
 ```
 
-Use `selectProvider` when a default provider should be chosen based on capability and registered providers. Use `routingPolicy` when selection depends on operation and scope, such as directing writes to a primary and reads to a replica. These callbacks select a provider ID; they do not implement health checks or failover by themselves.
+Use `selectProvider` when a default provider should be chosen based on capability and registered providers. Use `routingPolicy` when selection depends on operation and scope, such as directing writes to a primary and reads to a replica. Use `featurePolicy` to deny an SDK capability operation for a scope before provider selection. These callbacks do not implement health checks or failover by themselves.
 
 ## Add typed extensions
 
@@ -38,15 +38,15 @@ Register the implementation on a provider's `extensions` record. Route keys with
 
 ## Run safe SQL
 
-SQL is for application tables or operations that need relational transactions. Prefer domain APIs for Planet-managed graph, vector, memory, document, evidence, and identity data. Parameterize every user-controlled value:
+The application owns migrations for custom tables and indexes. Planet routes queries to its selected SQL provider, so application services do not need to import the database client. Use `planet.custom.sql` for application tables or operations that need relational transactions. Parameterize every user-controlled value:
 
 ```ts
-const result = await planet.sql.query<{ id: string }>({
+const result = await planet.custom.sql.query<{ id: string }>({
   text: 'SELECT id FROM app_audit WHERE actor_id = $1 ORDER BY created_at DESC LIMIT $2',
   values: [actorId, 50],
 });
 
-await planet.sql.transaction(async (transaction) => {
+await planet.custom.sql.transaction(async (transaction) => {
   await transaction.query({
     text: 'INSERT INTO app_audit (id, actor_id, action) VALUES ($1, $2, $3)',
     values: [crypto.randomUUID(), actorId, 'knowledge-reviewed'],
@@ -54,7 +54,9 @@ await planet.sql.transaction(async (transaction) => {
 });
 ```
 
-`query` is the read path and `execute` is the write path. Transactions are optional at the contract level; the PostgreSQL provider implements them. SQL parameterization prevents value injection, but table/column authorization and tenant filtering remain application responsibilities.
+`query` is the read path and `execute` is the write path. The existing `planet.sql` API remains available. Transactions are optional at the contract level; the PostgreSQL provider implements them. SQL parameterization prevents value injection, but table/column authorization and tenant filtering remain application responsibilities.
+
+For MongoDB application collections, pass `customCollections: ['app_notes']` to `createMongoProvider`. Planet only exposes those registered collection names through `planet.custom.collection.find`, `insertOne`, `updateOne`, and `deleteOne`. The application creates and indexes them separately. Route this capability with `routing.collections` when multiple providers are configured. Filters and updates use MongoDB's query shape; tenant filtering remains the application's responsibility. The [Custom application data guide](/docs/guides/custom-data) shows setup and complete examples.
 
 ## Store source bytes in blob storage
 

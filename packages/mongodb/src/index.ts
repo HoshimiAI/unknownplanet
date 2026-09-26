@@ -1,11 +1,12 @@
 import type { Db, Document, Filter } from "mongodb";
 import type {
-  AddEvidenceInput, AddMemoryInput, CreateDocumentChunkInput, CreateDocumentInput, CreateEdgeInput, CreateNodeInput, DataLayerProvider,
+  AddEvidenceInput, AddMemoryInput, ClaimedQueueMessage, CollectionStore, CreateDocumentChunkInput, CreateDocumentInput, CreateEdgeInput, CreateNodeInput, DataLayerProvider, ProviderSchemaMap,
   CreateIngestionJobInput, DocumentChunk, DocumentChunkStore, DocumentId, DocumentStore, EdgeId, Evidence, EvidenceListInput, EvidenceStore, GraphEdge, IngestionJob, IngestionJobStore,
   GraphNode, GraphStore, GraphTextSearchInput, GraphTraversal, JsonObject, MemoryRecord, MemorySearchInput, MemoryStore, NeighborsInput, NodeId, NodeMergeRecord, PlanetDocument,
-  PlanetScope, TraverseInput, UpdateEdgeInput, UpdateIngestionJobInput, UpdateNodeInput, VectorRecord, VectorSearchInput, VectorSearchResult, VectorStore,
+  PlanetScope, TraverseInput, UpdateEdgeInput, UpdateIngestionJobInput, UpdateNodeInput, VectorRecord, VectorSearchInput, VectorSearchResult, VectorStore, JsonValue, QueueMessage, QueueStore, StackStore, KeyValueStore,
 } from "@unknown-planet/core";
 import { EmbeddingDimensionMismatchError } from "@unknown-planet/core";
+import { scopeStorageKey } from "@unknown-planet/core";
 
 interface NodeDoc extends Document { _id: string; scopeId: string; type: string; name: string; properties: JsonObject; embedding?: number[]; createdAt: Date; updatedAt: Date }
 interface EdgeDoc extends Document { _id: string; scopeId: string; sourceId: string; targetId: string; relation: string; properties: JsonObject; confidence?: number; validFrom?: Date; validTo?: Date; status?: GraphEdge["status"]; createdAt: Date; updatedAt: Date }
@@ -15,8 +16,12 @@ interface EvidenceDoc extends Document { _id: string; scopeId: string; edgeId: s
 interface MemoryDoc extends Document { _id: string; scopeId: string; agentId: string; userId?: string; sessionId?: string; content: string; type: MemoryRecord["type"]; importance?: number; confidence?: number; source?: MemoryRecord["source"]; metadata: JsonObject; createdAt: Date; updatedAt: Date }
 interface VectorDoc extends Document { _id: string; id: string; scopeId: string; namespace: string; model?: string; embedding: number[]; metadata: JsonObject; createdAt: Date; updatedAt: Date }
 interface NodeMergeDoc extends Document { scopeId: string; sourceId: string; targetId: string; mergedAt: Date; source: GraphNode; targetBefore: GraphNode; targetAfter: GraphNode }
-interface IngestionJobDoc extends Document { _id: string; scopeId: string; kind: IngestionJob["kind"]; status: IngestionJob["status"]; checkpoint: IngestionJob["checkpoint"]; attempts: number; maxAttempts: number; input: JsonObject; nextAttemptAt: Date; leaseUntil?: Date; lastError?: string; createdAt: Date; updatedAt: Date }
-const scopeId = (scope?: PlanetScope) => scope?.workspaceId ? `${scope.tenantId}:${scope.workspaceId}` : (scope?.tenantId ?? "default");
+interface IngestionJobDoc extends Document { _id: string; scopeId: string; kind: IngestionJob["kind"]; status: IngestionJob["status"]; checkpoint: IngestionJob["checkpoint"]; attempts: number; maxAttempts: number; input: JsonObject; nextAttemptAt: Date; leaseUntil?: Date; leaseToken?: string; lastError?: string; createdAt: Date; updatedAt: Date }
+interface QueueDoc extends Document { _id: string; scopeId: string; queue: string; value: JsonValue; status: "ready" | "leased"; attempts: number; availableAt: Date; leaseUntil?: Date; leaseToken?: string; createdAt: Date }
+interface StackEntryDoc extends Document { _id: string; scopeId: string; stack: string; sequence: number; value: JsonValue; createdAt: Date }
+interface StackCounterDoc extends Document { scopeId: string; stack: string; sequence: number }
+interface KeyValueDoc extends Document { scopeId: string; namespace: string; key: string; value: JsonValue; expiresAt?: Date; updatedAt: Date }
+const scopeId = scopeStorageKey;
 
 const node = (value: NodeDoc): GraphNode => ({ id: value._id, type: value.type, name: value.name, properties: value.properties ?? {}, embedding: value.embedding, createdAt: value.createdAt, updatedAt: value.updatedAt });
 const edge = (value: EdgeDoc): GraphEdge => ({ id: value._id, sourceId: value.sourceId, targetId: value.targetId, relation: value.relation, properties: value.properties ?? {}, confidence: value.confidence, validFrom: value.validFrom, validTo: value.validTo, status: value.status ?? "candidate", createdAt: value.createdAt, updatedAt: value.updatedAt });
@@ -93,6 +98,14 @@ export class MongoGraphStore implements GraphStore {
     if (input.nodeId) filter.$or = [{ sourceId: input.nodeId }, { targetId: input.nodeId }];
     return (await this.merges.find(filter).sort({ mergedAt: -1, sourceId: 1 }).limit(Math.max(1, Math.min(input.limit ?? 100, 100000))).toArray()).map(({ sourceId, targetId, mergedAt, source, targetBefore, targetAfter }) => ({ sourceId, targetId, mergedAt, source, targetBefore, targetAfter }));
   }
+  async listMergesPage(input: { nodeId?: NodeId; limit?: number; afterSourceId?: string; scope?: PlanetScope }): Promise<{ items: NodeMergeRecord[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const filter: Filter<NodeMergeDoc> = { scopeId: scopeId(input.scope) };
+    if (input.nodeId) filter.$or = [{ sourceId: input.nodeId }, { targetId: input.nodeId }];
+    if (input.afterSourceId) filter.sourceId = { $gt: input.afterSourceId };
+    const rows = await this.merges.find(filter).sort({ sourceId: 1 }).limit(limit + 1).toArray();
+    return { items: rows.slice(0, limit).map(({ sourceId, targetId, mergedAt, source, targetBefore, targetAfter }) => ({ sourceId, targetId, mergedAt, source, targetBefore, targetAfter })), hasMore: rows.length > limit };
+  }
   async createEdge(input: CreateEdgeInput): Promise<GraphEdge> {
     const [from, to] = await Promise.all([this.nodes.countDocuments({ _id: input.from, scopeId: scopeId(input.scope) }, { limit: 1 }), this.nodes.countDocuments({ _id: input.to, scopeId: scopeId(input.scope) }, { limit: 1 })]);
     if (!from || !to) throw new Error("Cannot create an edge whose endpoint node does not exist.");
@@ -147,6 +160,14 @@ export class MongoDocumentChunkStore implements DocumentChunkStore {
   async list(input: { documentId: string; limit?: number; scope?: PlanetScope }): Promise<DocumentChunk[]> { return (await this.chunks.find({ documentId: input.documentId, scopeId: scopeId(input.scope) }).sort({ startOffset: 1, _id: 1 }).limit(input.limit ?? 100).toArray()).map(chunk); }
   async listPage(input: { documentId: string; limit?: number; afterId?: string; scope?: PlanetScope }): Promise<{ items: DocumentChunk[]; hasMore: boolean }> { const limit = Math.max(1, Math.min(input.limit ?? 100, 500)); const filter: Filter<ChunkDoc> = { documentId: input.documentId, scopeId: scopeId(input.scope) }; if (input.afterId) filter._id = { $gt: input.afterId }; const rows = await this.chunks.find(filter).sort({ _id: 1 }).limit(limit + 1).toArray(); return { items: rows.slice(0, limit).map(chunk), hasMore: rows.length > limit }; }
   async search(input: { query: string; limit?: number; scope?: PlanetScope }): Promise<DocumentChunk[]> { const escaped = input.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); return (await this.chunks.find({ scopeId: scopeId(input.scope), text: { $regex: escaped, $options: "i" } }).sort({ _id: 1 }).limit(input.limit ?? 20).toArray()).map(chunk); }
+  async searchPage(input: { query: string; limit?: number; afterId?: string; scope?: PlanetScope }): Promise<{ items: DocumentChunk[]; hasMore: boolean }> {
+    const escaped = input.query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const limit = Math.max(1, Math.min(input.limit ?? 20, 500));
+    const filter: Filter<ChunkDoc> = { scopeId: scopeId(input.scope), text: { $regex: escaped, $options: "i" } };
+    if (input.afterId) filter._id = { $gt: input.afterId };
+    const rows = await this.chunks.find(filter).sort({ _id: 1 }).limit(limit + 1).toArray();
+    return { items: rows.slice(0, limit).map(chunk), hasMore: rows.length > limit };
+  }
   async deleteExcept(input: { documentId: string; keepIds: string[]; scope?: PlanetScope }): Promise<number> { const result = await this.chunks.deleteMany({ scopeId: scopeId(input.scope), documentId: input.documentId, _id: { $nin: input.keepIds } }); return result.deletedCount; }
 }
 
@@ -169,7 +190,19 @@ export class MongoEvidenceStore implements EvidenceStore {
     if (input.sourceId) filter.sourceId = input.sourceId;
     return (await this.evidence.find(filter).sort({ createdAt: 1, _id: 1 }).limit(input.limit ?? 100).toArray()).map(evidence);
   }
+  async listPage(input: EvidenceListInput & { afterId?: string }): Promise<{ items: Evidence[]; hasMore: boolean }> {
+    const limit = Math.max(1, Math.min(input.limit ?? 100, 500));
+    const filter: Filter<EvidenceDoc> = { scopeId: scopeId(input.scope) };
+    if (input.edgeId) filter.edgeId = input.edgeId;
+    if (input.edgeIds?.length) filter.edgeId = { $in: input.edgeIds };
+    if (input.documentId) filter.documentId = input.documentId;
+    if (input.sourceId) filter.sourceId = input.sourceId;
+    if (input.afterId) filter._id = { $gt: input.afterId };
+    const rows = await this.evidence.find(filter).sort({ _id: 1 }).limit(limit + 1).toArray();
+    return { items: rows.slice(0, limit).map(evidence), hasMore: rows.length > limit };
+  }
   async deleteByDocument(input: { documentId: string; scope?: PlanetScope }): Promise<number> { return (await this.evidence.deleteMany({ scopeId: scopeId(input.scope), documentId: input.documentId })).deletedCount ?? 0; }
+  async deleteByChunks(input: { chunkIds: string[]; scope?: PlanetScope }): Promise<number> { if (!input.chunkIds.length) return 0; return (await this.evidence.deleteMany({ scopeId: scopeId(input.scope), chunkId: { $in: input.chunkIds } })).deletedCount ?? 0; }
 }
 
 /** Uses MongoDB Atlas Vector Search. Create an Atlas vector index for `embedding` before querying. */
@@ -223,7 +256,7 @@ export class MongoMemoryStore implements MemoryStore {
     if (input.sessionId) filter.sessionId = input.sessionId;
     if (input.type) filter.type = input.type;
     if (input.afterId) filter._id = { $gt: input.afterId };
-    if (input.query?.trim()) filter.content = { $regex: input.query.trim().replace(/[.*+?^${}()|[\\]\\]/g, "\\$&"), $options: "i" };
+    if (input.query?.trim()) filter.content = { $regex: input.query.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), $options: "i" };
     for (const [key, value] of Object.entries(input.metadata ?? {})) (filter as Record<string, unknown>)[`metadata.${key}`] = value;
     const limit = Math.max(1, Math.min(input.limit ?? 20, 500));
     const rows = await this.memories.find(filter).sort({ _id: 1 }).limit(limit + 1).toArray();
@@ -233,7 +266,7 @@ export class MongoMemoryStore implements MemoryStore {
   private toMemory(value: MemoryDoc): MemoryRecord { return { id: value._id, agentId: value.agentId, userId: value.userId, sessionId: value.sessionId, content: value.content, type: value.type, importance: value.importance, confidence: value.confidence, source: value.source, metadata: value.metadata ?? {}, createdAt: value.createdAt, updatedAt: value.updatedAt }; }
 }
 
-const toIngestionJob = (value: IngestionJobDoc): IngestionJob => ({ id: value._id, kind: value.kind, status: value.status, checkpoint: value.checkpoint, attempts: value.attempts, maxAttempts: value.maxAttempts, input: value.input ?? {}, nextAttemptAt: value.nextAttemptAt, leaseUntil: value.leaseUntil, lastError: value.lastError, createdAt: value.createdAt, updatedAt: value.updatedAt });
+const toIngestionJob = (value: IngestionJobDoc): IngestionJob => ({ id: value._id, kind: value.kind, status: value.status, checkpoint: value.checkpoint, attempts: value.attempts, maxAttempts: value.maxAttempts, input: value.input ?? {}, nextAttemptAt: value.nextAttemptAt, leaseUntil: value.leaseUntil, leaseToken: value.leaseToken, lastError: value.lastError, createdAt: value.createdAt, updatedAt: value.updatedAt });
 export class MongoIngestionJobStore implements IngestionJobStore {
   private readonly jobs;
   constructor(db: Db) { this.jobs = db.collection<IngestionJobDoc>("ingestion_jobs"); }
@@ -241,7 +274,11 @@ export class MongoIngestionJobStore implements IngestionJobStore {
     const currentScope = scopeId(input.scope); const now = new Date();
     const value: IngestionJobDoc = { _id: input.id, scopeId: currentScope, kind: input.kind, status: "queued", checkpoint: "queued", attempts: 0, maxAttempts: input.maxAttempts ?? 5, input: input.input, nextAttemptAt: now, createdAt: now, updatedAt: now };
     const update = { scopeId: currentScope, kind: value.kind, status: value.status, checkpoint: value.checkpoint, attempts: value.attempts, maxAttempts: value.maxAttempts, input: value.input, nextAttemptAt: value.nextAttemptAt, updatedAt: value.updatedAt };
-    await this.jobs.updateOne({ _id: input.id, scopeId: currentScope }, { $set: { ...update, updatedAt: now }, $setOnInsert: { createdAt: now } }, { upsert: true });
+    const reset = await this.jobs.updateOne({ _id: input.id, scopeId: currentScope, status: { $in: ["succeeded", "failed"] } }, { $set: update, $unset: { leaseUntil: "", leaseToken: "", lastError: "" } });
+    if (!reset.matchedCount) {
+      try { await this.jobs.insertOne(value); }
+      catch (error) { if (!(error && typeof error === "object" && "code" in error && error.code === 11000)) throw error; }
+    }
     const result = await this.get(input.id, input.scope); if (!result) throw new Error("Ingestion job upsert did not persist a record."); return result;
   }
   async get(id: string, scope?: PlanetScope): Promise<IngestionJob | null> { const value = await this.jobs.findOne({ _id: id, scopeId: scopeId(scope) }); return value ? toIngestionJob(value) : null; }
@@ -253,16 +290,27 @@ export class MongoIngestionJobStore implements IngestionJobStore {
     if (input.input !== undefined) $set.input = input.input;
     if (input.nextAttemptAt !== undefined) { if (input.nextAttemptAt === null) $unset.nextAttemptAt = ""; else $set.nextAttemptAt = input.nextAttemptAt; }
     if (input.leaseUntil !== undefined) { if (input.leaseUntil === null) $unset.leaseUntil = ""; else $set.leaseUntil = input.leaseUntil; }
+    if (input.leaseToken !== undefined) { if (input.leaseToken === null) $unset.leaseToken = ""; else $set.leaseToken = input.leaseToken; }
     if (input.lastError !== undefined) { if (input.lastError === null) $unset.lastError = ""; else $set.lastError = input.lastError; }
-    await this.jobs.updateOne({ _id: input.id, scopeId: scopeId(input.scope) }, { $set, ...(Object.keys($unset).length ? { $unset } : {}) });
+    const filter: Filter<IngestionJobDoc> = { _id: input.id, scopeId: scopeId(input.scope) };
+    if (input.expectedLeaseToken !== undefined) { filter.status = "processing"; filter.leaseToken = input.expectedLeaseToken; filter.leaseUntil = { $gt: new Date() }; }
+    else filter.status = { $ne: "processing" };
+    const changed = await this.jobs.updateOne(filter, { $set, ...(Object.keys($unset).length ? { $unset } : {}) });
+    if (!changed.matchedCount) throw new Error("Ingestion job does not exist or its lease is no longer owned by this worker.");
     const result = await this.get(input.id, input.scope); if (!result) throw new Error("Ingestion job does not exist in this scope."); return result;
+  }
+  async claim(input: { id: string; leaseMs?: number; scope?: PlanetScope }): Promise<IngestionJob> {
+    const now = new Date();
+    const job = await this.jobs.findOneAndUpdate({ _id: input.id, scopeId: scopeId(input.scope), $expr: { $lt: ["$attempts", "$maxAttempts"] }, $or: [{ status: { $in: ["queued", "retry_wait"] }, nextAttemptAt: { $lte: now } }, { status: "processing", leaseUntil: { $lte: now } }] }, { $set: { status: "processing", leaseUntil: new Date(now.getTime() + Math.max(1000, input.leaseMs ?? 60_000)), leaseToken: crypto.randomUUID(), updatedAt: now }, $inc: { attempts: 1 } }, { returnDocument: "after", includeResultMetadata: false });
+    if (!job) throw new Error("Ingestion job is not available for claim.");
+    return toIngestionJob(job);
   }
   async claimDue(input: { now?: Date; limit?: number; leaseMs?: number; scope?: PlanetScope }): Promise<IngestionJob[]> {
     const now = input.now ?? new Date(); const leaseUntil = new Date(now.getTime() + Math.max(1000, input.leaseMs ?? 60_000)); const jobs: IngestionJob[] = [];
     const limit = Math.max(1, Math.min(input.limit ?? 10, 100));
-    await this.jobs.updateMany({ scopeId: scopeId(input.scope), $expr: { $gte: ["$attempts", "$maxAttempts"] }, $or: [{ status: "retry_wait", nextAttemptAt: { $lte: now } }, { status: "processing", leaseUntil: { $lte: now } }] }, { $set: { status: "failed", lastError: "Retry limit exceeded.", updatedAt: now }, $unset: { leaseUntil: "" } });
+    await this.jobs.updateMany({ scopeId: scopeId(input.scope), $expr: { $gte: ["$attempts", "$maxAttempts"] }, $or: [{ status: "retry_wait", nextAttemptAt: { $lte: now } }, { status: "processing", leaseUntil: { $lte: now } }] }, { $set: { status: "failed", lastError: "Retry limit exceeded.", updatedAt: now }, $unset: { leaseUntil: "", leaseToken: "" } });
     for (let index = 0; index < limit; index += 1) {
-      const job = await this.jobs.findOneAndUpdate({ scopeId: scopeId(input.scope), $expr: { $lt: ["$attempts", "$maxAttempts"] }, $or: [{ status: { $in: ["queued", "retry_wait"] }, nextAttemptAt: { $lte: now } }, { status: "processing", leaseUntil: { $lte: now } }] }, { $set: { status: "processing", leaseUntil, updatedAt: now }, $inc: { attempts: 1 } }, { sort: { nextAttemptAt: 1, _id: 1 }, returnDocument: "after", includeResultMetadata: false });
+      const job = await this.jobs.findOneAndUpdate({ scopeId: scopeId(input.scope), $expr: { $lt: ["$attempts", "$maxAttempts"] }, $or: [{ status: { $in: ["queued", "retry_wait"] }, nextAttemptAt: { $lte: now } }, { status: "processing", leaseUntil: { $lte: now } }] }, { $set: { status: "processing", leaseUntil, leaseToken: crypto.randomUUID(), updatedAt: now }, $inc: { attempts: 1 } }, { sort: { nextAttemptAt: 1, _id: 1 }, returnDocument: "after", includeResultMetadata: false });
       if (!job) break;
       jobs.push(toIngestionJob(job));
     }
@@ -270,12 +318,139 @@ export class MongoIngestionJobStore implements IngestionJobStore {
   }
 }
 
-export function createMongoProvider(input: { id?: string; database: Db; vectorIndex?: string; vectorCollections?: Record<string, { dimensions: number; model?: string }> }): DataLayerProvider {
-  return { id: input.id ?? "mongodb", graph: new MongoGraphStore(input.database), documents: new MongoDocumentStore(input.database), chunks: new MongoDocumentChunkStore(input.database), evidence: new MongoEvidenceStore(input.database), memories: new MongoMemoryStore(input.database), ingestionJobs: new MongoIngestionJobStore(input.database), vector: new MongoAtlasVectorStore(input.database, input.vectorIndex, input.vectorCollections), vectorCollections: input.vectorCollections };
+const assertNamedStoreKey = (value: string, label: string) => { if (!value.trim()) throw new Error(`${label} cannot be empty.`); };
+const queueMessage = (value: QueueDoc): QueueMessage => ({ id: value._id, queue: value.queue, value: value.value, attempts: value.attempts, availableAt: value.availableAt });
+export class MongoQueueStore implements QueueStore {
+  private readonly messages;
+  constructor(db: Db) { this.messages = db.collection<QueueDoc>("queue_messages"); }
+  async enqueue(input: { queue: string; value: JsonValue; delayMs?: number; scope?: PlanetScope }): Promise<QueueMessage> {
+    assertNamedStoreKey(input.queue, "Queue name"); const delay = input.delayMs ?? 0; if (!Number.isFinite(delay) || delay < 0) throw new Error("Queue delayMs must be a non-negative number.");
+    const now = new Date(); const value: QueueDoc = { _id: crypto.randomUUID(), scopeId: scopeId(input.scope), queue: input.queue, value: input.value, status: "ready", attempts: 0, availableAt: new Date(now.getTime() + delay), createdAt: now }; await this.messages.insertOne(value); return queueMessage(value);
+  }
+  async claim(input: { queue: string; limit?: number; leaseMs?: number; scope?: PlanetScope }): Promise<ClaimedQueueMessage[]> {
+    assertNamedStoreKey(input.queue, "Queue name"); const rawLimit = input.limit ?? 1; const leaseMs = input.leaseMs ?? 60_000; if (!Number.isFinite(rawLimit) || !Number.isFinite(leaseMs)) throw new Error("Queue limit and leaseMs must be finite numbers."); const limit = Math.max(1, Math.min(Math.floor(rawLimit), 100)); const now = new Date(); const claimed: ClaimedQueueMessage[] = [];
+    for (let index = 0; index < limit; index += 1) { const value = await this.messages.findOneAndUpdate({ scopeId: scopeId(input.scope), queue: input.queue, $or: [{ status: "ready", availableAt: { $lte: now } }, { status: "leased", availableAt: { $lte: now }, leaseUntil: { $lte: now } }] }, { $set: { status: "leased", leaseUntil: new Date(now.getTime() + Math.max(1000, leaseMs)), leaseToken: crypto.randomUUID() }, $inc: { attempts: 1 } }, { sort: { availableAt: 1, _id: 1 }, returnDocument: "after", includeResultMetadata: false }); if (!value) break; if (!value.leaseToken || !value.leaseUntil) throw new Error("MongoDB returned a queue claim without a lease."); claimed.push({ ...queueMessage(value), leaseToken: value.leaseToken, leaseUntil: value.leaseUntil }); }
+    return claimed;
+  }
+  async ack(input: { queue: string; id: string; leaseToken: string; scope?: PlanetScope }): Promise<boolean> { return (await this.messages.deleteOne({ _id: input.id, scopeId: scopeId(input.scope), queue: input.queue, status: "leased", leaseToken: input.leaseToken, leaseUntil: { $gt: new Date() } })).deletedCount === 1; }
+  async release(input: { queue: string; id: string; leaseToken: string; delayMs?: number; scope?: PlanetScope }): Promise<boolean> { const delay = input.delayMs ?? 0; if (!Number.isFinite(delay) || delay < 0) throw new Error("Queue delayMs must be a non-negative number."); const result = await this.messages.updateOne({ _id: input.id, scopeId: scopeId(input.scope), queue: input.queue, status: "leased", leaseToken: input.leaseToken, leaseUntil: { $gt: new Date() } }, { $set: { status: "ready", availableAt: new Date(Date.now() + delay) }, $unset: { leaseUntil: "", leaseToken: "" } }); return result.modifiedCount === 1; }
+}
+export class MongoStackStore implements StackStore {
+  private readonly entries;
+  private readonly counters;
+  constructor(db: Db) { this.entries = db.collection<StackEntryDoc>("stack_entries"); this.counters = db.collection<StackCounterDoc>("stack_counters"); }
+  async push(input: { stack: string; value: JsonValue; scope?: PlanetScope }): Promise<void> { assertNamedStoreKey(input.stack, "Stack name"); const currentScope = scopeId(input.scope); const counter = await this.counters.findOneAndUpdate({ scopeId: currentScope, stack: input.stack }, { $inc: { sequence: 1 } }, { upsert: true, returnDocument: "after", includeResultMetadata: false }); if (!counter) throw new Error("Stack sequence allocation failed."); await this.entries.insertOne({ _id: crypto.randomUUID(), scopeId: currentScope, stack: input.stack, sequence: counter.sequence, value: input.value, createdAt: new Date() }); }
+  async pop(input: { stack: string; scope?: PlanetScope }): Promise<JsonValue | null> { assertNamedStoreKey(input.stack, "Stack name"); const value = await this.entries.findOneAndDelete({ scopeId: scopeId(input.scope), stack: input.stack }, { sort: { sequence: -1 } }); return value?.value ?? null; }
+  async peek(input: { stack: string; scope?: PlanetScope }): Promise<JsonValue | null> { assertNamedStoreKey(input.stack, "Stack name"); const value = await this.entries.find({ scopeId: scopeId(input.scope), stack: input.stack }).sort({ sequence: -1 }).limit(1).next(); return value?.value ?? null; }
+  async size(input: { stack: string; scope?: PlanetScope }): Promise<number> { assertNamedStoreKey(input.stack, "Stack name"); return this.entries.countDocuments({ scopeId: scopeId(input.scope), stack: input.stack }); }
+}
+export class MongoKeyValueStore implements KeyValueStore {
+  private readonly values;
+  constructor(db: Db) { this.values = db.collection<KeyValueDoc>("key_values"); }
+  async get(input: { namespace?: string; key: string; scope?: PlanetScope }): Promise<{ value: JsonValue; expiresAt?: Date } | null> { assertNamedStoreKey(input.key, "Key"); const value = await this.values.findOne({ scopeId: scopeId(input.scope), namespace: input.namespace ?? "default", key: input.key, $or: [{ expiresAt: { $exists: false } }, { expiresAt: { $gt: new Date() } }] }); return value ? { value: value.value, expiresAt: value.expiresAt } : null; }
+  async set(input: { namespace?: string; key: string; value: JsonValue; ttlMs?: number; scope?: PlanetScope }): Promise<void> { assertNamedStoreKey(input.key, "Key"); const ttl = input.ttlMs; if (ttl !== undefined && (!Number.isFinite(ttl) || ttl < 0)) throw new Error("Key/value ttlMs must be a non-negative number."); const now = new Date(); const document: KeyValueDoc = { scopeId: scopeId(input.scope), namespace: input.namespace ?? "default", key: input.key, value: input.value, ...(ttl === undefined ? {} : { expiresAt: new Date(now.getTime() + ttl) }), updatedAt: now }; await this.values.replaceOne({ scopeId: document.scopeId, namespace: document.namespace, key: document.key }, document, { upsert: true }); }
+  async delete(input: { namespace?: string; key: string; scope?: PlanetScope }): Promise<boolean> { assertNamedStoreKey(input.key, "Key"); return (await this.values.deleteOne({ scopeId: scopeId(input.scope), namespace: input.namespace ?? "default", key: input.key })).deletedCount === 1; }
+}
+
+const mongoFeatureCollections: Record<string, string> = {
+  nodes: "graph", edges: "graph", entity_merges: "graph", vectors: "vector", documents: "documents", document_chunks: "chunks", evidence: "evidence", memories: "memories", ingestion_jobs: "ingestionJobs", queue_messages: "queue", stack_entries: "stack", stack_counters: "stack", key_values: "keyValue",
+};
+function schemaMongoDatabase(db: Db, schemas: ProviderSchemaMap = {}): Db {
+  const prefixes = Object.fromEntries(Object.entries(schemas).filter(([feature]) => Object.values(mongoFeatureCollections).includes(feature)));
+  for (const [feature, prefix] of Object.entries(prefixes)) if (!prefix || !/^[A-Za-z0-9_-]+$/.test(prefix)) throw new Error(`MongoDB ${feature} namespace must contain only letters, numbers, underscores, or hyphens.`);
+  return new Proxy(db, { get(target, property, receiver) {
+    if (property === "collection") return (name: string) => {
+      const feature = mongoFeatureCollections[name]; const prefix = feature ? prefixes[feature] as string | undefined : undefined;
+      return target.collection(prefix ? `${prefix}_${name}` : name);
+    };
+    return Reflect.get(target, property, receiver) as unknown;
+  } });
+}
+
+export class MongoCollectionStore implements CollectionStore {
+  private readonly allowed: ReadonlySet<string>;
+  constructor(private readonly db: Db, collections: readonly string[]) {
+    if (collections.some((name) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) throw new Error("Custom collection names must be simple identifiers.");
+    if (collections.some((name) => Object.hasOwn(mongoFeatureCollections, name) || name === "unknownplanet_scope_key_map")) throw new Error("Planet-managed collections cannot be registered as custom collections.");
+    this.allowed = new Set(collections);
+  }
+  private collection(name: string) {
+    if (!this.allowed.has(name)) throw new Error(`Custom collection '${name}' is not registered.`);
+    return this.db.collection(name);
+  }
+  async find<T extends Record<string, unknown> = Record<string, unknown>>(input: { collection: string; filter?: Record<string, unknown>; limit?: number }): Promise<T[]> {
+    const limit = input.limit ?? 100;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new Error("Custom collection find limit must be between 1 and 1000.");
+    return await this.collection(input.collection).find(input.filter ?? {}).limit(limit).toArray() as unknown as T[];
+  }
+  async insertOne(input: { collection: string; document: Record<string, unknown> }): Promise<{ insertedId: unknown }> {
+    const result = await this.collection(input.collection).insertOne(input.document);
+    return { insertedId: result.insertedId };
+  }
+  async updateOne(input: { collection: string; filter: Record<string, unknown>; update: Record<string, unknown> }): Promise<{ matchedCount: number; modifiedCount: number }> {
+    if (!Object.keys(input.filter).length) throw new Error("Custom collection update requires a non-empty filter.");
+    const result = await this.collection(input.collection).updateOne(input.filter, input.update);
+    return { matchedCount: result.matchedCount, modifiedCount: result.modifiedCount };
+  }
+  async deleteOne(input: { collection: string; filter: Record<string, unknown> }): Promise<{ deletedCount: number }> {
+    if (!Object.keys(input.filter).length) throw new Error("Custom collection delete requires a non-empty filter.");
+    const result = await this.collection(input.collection).deleteOne(input.filter);
+    return { deletedCount: result.deletedCount };
+  }
+}
+
+export function createMongoProvider(input: { id?: string; database: Db; vectorIndex?: string; vectorCollections?: Record<string, { dimensions: number; model?: string }>; schemas?: ProviderSchemaMap; customCollections?: readonly string[] }): DataLayerProvider {
+  const database = schemaMongoDatabase(input.database, input.schemas);
+  return { id: input.id ?? "mongodb", graph: new MongoGraphStore(database), documents: new MongoDocumentStore(database), chunks: new MongoDocumentChunkStore(database), evidence: new MongoEvidenceStore(database), memories: new MongoMemoryStore(database), ingestionJobs: new MongoIngestionJobStore(database), queue: new MongoQueueStore(database), stack: new MongoStackStore(database), keyValue: new MongoKeyValueStore(database), vector: new MongoAtlasVectorStore(database, input.vectorIndex, input.vectorCollections), vectorCollections: input.vectorCollections, collections: input.customCollections?.length ? new MongoCollectionStore(input.database, input.customCollections) : undefined };
+}
+
+/** Migrate Planet-owned collections before deploying the v2 scope-key readers. Stop writers first. */
+export async function migrateMongoScopeKeys(db: Db, mappings: Readonly<Record<string, PlanetScope>>, schemas: ProviderSchemaMap = {}): Promise<void> {
+  const database = schemaMongoDatabase(db, schemas);
+  const collections = Object.keys(mongoFeatureCollections).map((name) => database.collection(name));
+  const migrationMap = db.collection<{ _id: string; newKey: string }>("unknownplanet_scope_key_map");
+  const recorded = await migrationMap.find().toArray();
+  const knownDestinations = new Set(recorded.map((item) => item.newKey));
+  const recordedByOldKey = new Map(recorded.map((item) => [item._id, item.newKey]));
+  const oldKeys = new Set<string>();
+  for (const collection of collections) {
+    for (const key of await collection.distinct<string>("scopeId")) if (typeof key === "string") oldKeys.add(key);
+  }
+  const changes = new Map<string, string>();
+  const destinations = new Map<string, string>(recorded.map((item) => [item.newKey, item._id]));
+  for (const oldKey of oldKeys) {
+    if (knownDestinations.has(oldKey)) continue;
+    const recordedNext = recordedByOldKey.get(oldKey);
+    const mapped = Object.hasOwn(mappings, oldKey) ? mappings[oldKey] : undefined;
+    if (!recordedNext && !mapped && oldKey.includes(":")) throw new Error(`Ambiguous legacy scope key '${oldKey}'. Supply its tenant/workspace mapping before migrating.`);
+    const next = recordedNext ?? scopeStorageKey(mapped ?? { tenantId: oldKey });
+    if (recordedNext && mapped && recordedNext !== scopeStorageKey(mapped)) throw new Error(`Legacy scope key '${oldKey}' was previously mapped to a different destination.`);
+    const prior = destinations.get(next);
+    if (prior && prior !== oldKey) throw new Error(`Legacy scope keys '${prior}' and '${oldKey}' map to the same destination.`);
+    destinations.set(next, oldKey);
+    if (next !== oldKey) changes.set(oldKey, next);
+  }
+  for (const [oldKey, next] of changes) await migrationMap.updateOne({ _id: oldKey }, { $setOnInsert: { newKey: next } }, { upsert: true });
+  for (const collection of collections.filter((item) => item.collectionName !== database.collection("vectors").collectionName)) {
+    for (const [oldKey, next] of changes) await collection.updateMany({ scopeId: oldKey }, { $set: { scopeId: next } });
+  }
+  const vectors = database.collection<VectorDoc>("vectors");
+  for (const [oldKey, next] of changes) {
+    for await (const vector of vectors.find({ scopeId: oldKey })) {
+      const session = db.client.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await vectors.insertOne({ ...vector, _id: `${next}:${vector.namespace}:${vector.id}`, scopeId: next }, { session });
+          await vectors.deleteOne({ _id: vector._id, scopeId: oldKey }, { session });
+        });
+      } finally { await session.endSession(); }
+    }
+  }
 }
 
 /** Create the compound indexes used by the Mongo adapters. Atlas vector search index definitions remain managed by Atlas. */
-export async function initializeMongoIndexes(db: Db): Promise<void> {
+export async function initializeMongoIndexes(db: Db, schemas: ProviderSchemaMap = {}): Promise<void> {
+  db = schemaMongoDatabase(db, schemas);
   await Promise.all([
     db.collection("nodes").createIndex({ scopeId: 1, name: 1 }, { name: "planet_nodes_scope_name" }),
     db.collection("edges").createIndex({ scopeId: 1, sourceId: 1, relation: 1 }, { name: "planet_edges_scope_source" }),
@@ -291,5 +466,10 @@ export async function initializeMongoIndexes(db: Db): Promise<void> {
     db.collection("entity_merges").createIndex({ scopeId: 1, sourceId: 1 }, { name: "planet_entity_merges_scope_source", unique: true }),
     db.collection("entity_merges").createIndex({ scopeId: 1, targetId: 1, mergedAt: -1 }, { name: "planet_entity_merges_scope_target" }),
     db.collection("ingestion_jobs").createIndex({ scopeId: 1, status: 1, nextAttemptAt: 1, _id: 1 }, { name: "planet_ingestion_jobs_due" }),
+    db.collection("queue_messages").createIndex({ scopeId: 1, queue: 1, status: 1, availableAt: 1, _id: 1 }, { name: "planet_queue_claim" }),
+    db.collection("stack_counters").createIndex({ scopeId: 1, stack: 1 }, { name: "planet_stack_counter", unique: true }),
+    db.collection("stack_entries").createIndex({ scopeId: 1, stack: 1, sequence: -1 }, { name: "planet_stack_order", unique: true }),
+    db.collection("key_values").createIndex({ scopeId: 1, namespace: 1, key: 1 }, { name: "planet_key_value_key", unique: true }),
+    db.collection("key_values").createIndex({ expiresAt: 1 }, { name: "planet_key_value_expiry", expireAfterSeconds: 0, partialFilterExpression: { expiresAt: { $type: "date" } } }),
   ]);
 }

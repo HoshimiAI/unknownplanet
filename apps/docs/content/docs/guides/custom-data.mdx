@@ -1,0 +1,235 @@
+---
+title: Custom application data
+description: Migrate your own tables and collections, then query them through Planet providers.
+---
+
+Planet owns the APIs and storage contracts for its built-in graph, vector, memory, document, evidence, and other capabilities. Your application owns the structure and migrations for its own tables and collections. Planet does not create application tables, columns, collections, or indexes.
+
+There are two separate features:
+
+| Need | Planet API | Database changes |
+| --- | --- | --- |
+| Validate JSON fields on built-in Planet records | `validationSchemas` | None |
+| Query an application-owned PostgreSQL table | `planet.custom.sql` | Apply your application migration |
+| Query an application-owned MongoDB collection | `planet.custom.collection` | Create your collection and indexes |
+
+`customSchemas` remains a compatibility alias for `validationSchemas`. Neither option provisions database structure or validates results from `planet.custom`.
+
+## Customize memory and graph through Planet
+
+Choose the level of customization you need:
+
+| Goal | Configure or implement | Use through Planet |
+| --- | --- | --- |
+| Add application fields to existing records | `metadata` on memories, `properties` on graph nodes and edges; optionally `validationSchemas` | `planet.memory.*`, `planet.graph.*` |
+| Put Planet memory and graph tables in different PostgreSQL schemas | Provider `schemas` map and capability `routing` | `planet.memory.*`, `planet.graph.*` |
+| Use a different physical memory or graph model | Implement `MemoryStore` or `GraphStore` and register a `DataLayerProvider` | The same `planet.memory.*` or `planet.graph.*` APIs |
+| Keep a separate application table for memory-related data | Application migration and routed `SqlStore` | `planet.custom.sql.*` |
+
+For example, a PostgreSQL provider can keep Planet's graph and memory tables in separate schemas. Apply Planet's ordered migrations to both `knowledge` and `agent_memory` before starting the service. The graph, documents, chunks, and evidence capabilities must share one PostgreSQL schema because their tables have foreign keys. Migrate the application-owned `app` schema separately.
+
+```ts
+const provider = createPostgresProvider({
+  database: pool,
+  schemas: {
+    graph: 'knowledge',
+    documents: 'knowledge',
+    chunks: 'knowledge',
+    evidence: 'knowledge',
+    memories: 'agent_memory',
+    sql: 'app',
+  },
+});
+
+const planet = new Planet({
+  providers: [provider],
+  routing: { graph: 'postgres', memories: 'postgres', sql: 'postgres' },
+  validationSchemas: {
+    memory: {
+      type: 'object',
+      properties: { sourceSystem: { type: 'string' } },
+      required: ['sourceSystem'],
+      additionalProperties: true,
+    },
+  },
+});
+
+const scoped = planet.withScope({ tenantId: 'acme' });
+await scoped.memory.persist({
+  agentId: 'support-assistant',
+  type: 'preference',
+  content: 'Use concise answers.',
+  metadata: { sourceSystem: 'support-app' },
+});
+await scoped.graph.node.create({
+  type: 'Customer',
+  name: 'Ada',
+  properties: { customerId: 'customer-42' },
+});
+```
+
+`memory.persist` writes a memory record without embedding or graph ingestion. `memory.add` also needs embedding, vector, and graph capabilities. The `validationSchemas.memory` definition validates memory metadata; it does not add a SQL column. If your own table layout must back `planet.memory.*`, implement the complete `MemoryStore` contract in `@unknown-planet/core` and register it as a provider. The same applies to a custom graph model through `GraphStore`.
+
+For a separate SQL database, register a second provider and route only `sql` to it. `PostgresSqlStore` accepts a connected pool and an optional search-path schema:
+
+```ts
+import { PostgresSqlStore } from '@unknown-planet/postgres';
+
+const planet = new Planet({
+  providers: [
+    createPostgresProvider({ id: 'knowledge-db', database: knowledgePool }),
+    { id: 'app-db', sql: new PostgresSqlStore(appPool, 'app') },
+  ],
+  routing: {
+    graph: 'knowledge-db',
+    memories: 'knowledge-db',
+    sql: 'app-db',
+  },
+});
+
+const rows = await planet.custom.sql.query<{ id: string }>({
+  text: 'SELECT id FROM notes WHERE tenant_id = $1',
+  values: ['acme'],
+});
+```
+
+This SQL route does not make `notes` part of Planet's memory search or graph traversal. Your application can link a row ID in memory metadata or graph properties and fetch the full row through `planet.custom.sql`. `withScope()` scopes Planet memory and graph methods; include tenant conditions explicitly in custom SQL.
+
+## PostgreSQL: migrate, configure, query
+
+Apply a migration with your application's migration tool. For example, this table belongs to your application, not to Planet's ordered migrations:
+
+```sql
+CREATE SCHEMA IF NOT EXISTS app;
+
+CREATE TABLE app.notes (
+  id uuid PRIMARY KEY,
+  tenant_id text NOT NULL,
+  title text NOT NULL
+);
+
+CREATE INDEX notes_tenant_id_idx ON app.notes (tenant_id, id);
+```
+
+Configure the PostgreSQL provider after connecting a pool. Planet's built-in tables still need Planet's own migrations in the schema used by those capabilities. The `schemas.sql` setting selects the search path for custom SQL. A non-public SQL schema requires a transactional pool, such as `pg.Pool`.
+
+```ts
+import { Pool } from 'pg';
+import { Planet } from '@unknown-planet/sdk';
+import { createPostgresProvider } from '@unknown-planet/postgres';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const planet = new Planet({
+  providers: [createPostgresProvider({ database: pool, schemas: { sql: 'app' } })],
+  routing: { sql: 'postgres' },
+});
+
+const tenantId = 'acme'; // Derive this from authenticated application context.
+const result = await planet.custom.sql.query<{ id: string; title: string }>({
+  text: 'SELECT id, title FROM notes WHERE tenant_id = $1 ORDER BY id LIMIT $2',
+  values: [tenantId, 50],
+});
+
+await planet.custom.sql.execute({
+  text: 'INSERT INTO notes (id, tenant_id, title) VALUES ($1, $2, $3)',
+  values: [crypto.randomUUID(), tenantId, 'Research'],
+});
+```
+
+`query` follows the SQL read route; `execute` follows the write route. `transaction` uses the transaction route and passes a `SqlTransaction` to the callback. The existing `planet.sql` API uses these same routes. Parameterize values; SQL parameters cannot stand in for table or column names.
+
+## MongoDB: register, then query
+
+Create the collection and indexes in your application's database setup. Register its name in the MongoDB provider to expose it through Planet. Planet rejects unregistered names and its own built-in collection names.
+
+```ts
+import { MongoClient } from 'mongodb';
+import { Planet } from '@unknown-planet/sdk';
+import { createMongoProvider } from '@unknown-planet/mongodb';
+
+const client = new MongoClient(process.env.MONGODB_URI!);
+await client.connect();
+const database = client.db('my_app');
+
+// Run this in your application migration/setup step.
+await database.createCollection('app_notes');
+await database.collection('app_notes').createIndex({ tenantId: 1, title: 1 });
+
+const planet = new Planet({
+  providers: [createMongoProvider({ database, customCollections: ['app_notes'] })],
+  routing: { collections: 'mongodb' },
+});
+
+const tenantId = 'acme'; // Derive this from authenticated application context.
+await planet.custom.collection.insertOne({
+  collection: 'app_notes',
+  document: { tenantId, title: 'Research' },
+});
+
+const notes = await planet.custom.collection.find<{ tenantId: string; title: string }>({
+  collection: 'app_notes',
+  filter: { tenantId },
+  limit: 50,
+});
+```
+
+`find` returns at most 100 records by default and accepts a limit from 1 to 1000. `updateOne` and `deleteOne` require a non-empty filter. Filters and updates use MongoDB's query shape. The application remains responsible for validating custom documents and for applying tenant filters to **every** custom query and write. `withScope()` does not inject a tenant condition into SQL or MongoDB custom queries.
+
+Application services can call Planet without importing a database client. The application bootstrap still creates the database connection and passes it to the provider. See [Providers](/docs/providers) for capability routing and [Custom integrations](/docs/guides/custom-integrations) for transactions and typed extensions.
+
+## Sample use case: support tickets for an AI assistant
+
+Suppose a support application owns tickets and an assistant needs to find them by topic. Keep the ticket's business fields in an application table. Index a small reference in Planet's graph so the assistant can discover relevant ticket IDs. The application remains the source of truth for ticket status and content.
+
+First, apply an application migration. This is separate from Planet's migrations:
+
+```sql
+CREATE TABLE app.support_tickets (
+  id uuid PRIMARY KEY,
+  tenant_id text NOT NULL,
+  subject text NOT NULL,
+  status text NOT NULL
+);
+
+CREATE INDEX support_tickets_tenant_idx ON app.support_tickets (tenant_id, id);
+```
+
+Use the PostgreSQL provider configuration above, and route both `sql` and `graph` to `postgres`. For each authenticated request, derive `tenantId` from the application session:
+
+```ts
+const scoped = planet.withScope({ tenantId });
+const ticketId = crypto.randomUUID();
+
+await scoped.custom.sql.execute({
+  text: 'INSERT INTO support_tickets (id, tenant_id, subject, status) VALUES ($1, $2, $3, $4)',
+  values: [ticketId, tenantId, 'Refund for duplicate charge', 'open'],
+});
+
+await scoped.graph.node.create({
+  id: ticketId,
+  type: 'SupportTicket',
+  name: 'Refund for duplicate charge',
+  properties: { ticketId },
+});
+
+const matches = await scoped.graph.search({
+  query: 'refund',
+  semantic: false,
+  includeContext: false,
+  limit: 10,
+});
+const ticketIds = matches
+  .filter(({ node }) => node.type === 'SupportTicket')
+  .map(({ node }) => node.id);
+
+const tickets = await scoped.custom.sql.query<{
+  id: string;
+  subject: string;
+  status: string;
+}>({
+  text: 'SELECT id, subject, status FROM support_tickets WHERE tenant_id = $1 AND id = ANY($2::uuid[])',
+  values: [tenantId, ticketIds],
+});
+```
+
+Graph search is scoped by `withScope()`. The SQL query still needs an explicit `tenant_id` condition. Keyword graph search works without an embedding provider; semantic search would additionally require configured embeddings and a vector store. These two writes are separate operations, so production code should use an application-owned outbox or repair job if ticket persistence succeeds but graph indexing fails. The assistant can then use the returned tickets as retrieval context while the application controls what content it may show.

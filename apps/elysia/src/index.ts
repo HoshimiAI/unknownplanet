@@ -99,7 +99,7 @@ const app = new Elysia({ name: "unknown-planet-live", prefix: "/v1" })
     const telemetry = requestTelemetry.get(request);
     if (telemetry && !completedRequests.has(request)) { telemetry.finish(status, error); completedRequests.add(request); }
     console.error(JSON.stringify({ event: "request.error", requestId: set.headers["x-request-id"], traceId: telemetry?.traceId, spanId: telemetry?.spanId, method: request.method, path: new URL(request.url).pathname, status, error: error instanceof Error ? error.name : "UnknownError" }));
-    return { error: error instanceof Error ? error.message : "Request failed", code: error instanceof PlanetError ? error.code : status === 401 ? "unauthorized" : status === 400 ? "invalid_request" : status === 404 ? "not_found" : status === 409 ? "conflict" : status === 503 ? "capability_unavailable" : "internal_error", requestId: set.headers["x-request-id"], ...(error && typeof error === "object" && "ingestionJobId" in error ? { jobId: (error as Error & { ingestionJobId: string }).ingestionJobId } : {}) };
+    return { error: status >= 500 ? "Request failed. See requestId for support." : error instanceof Error ? error.message : "Request failed", code: error instanceof PlanetError ? error.code : status === 401 ? "unauthorized" : status === 400 ? "invalid_request" : status === 404 ? "not_found" : status === 409 ? "conflict" : status === 503 ? "capability_unavailable" : "internal_error", requestId: set.headers["x-request-id"], ...(error && typeof error === "object" && "ingestionJobId" in error ? { jobId: (error as Error & { ingestionJobId: string }).ingestionJobId } : {}) };
   })
   .onAfterHandle(({ request, set }) => {
     const telemetry = requestTelemetry.get(request);
@@ -121,8 +121,8 @@ const app = new Elysia({ name: "unknown-planet-live", prefix: "/v1" })
       "/documents/{documentId}/chunks/page": { get: { summary: "List document chunks with stable cursor pagination", parameters: [{ in: "path", name: "documentId", required: true, schema: { type: "string" } }, { in: "query", name: "cursor", schema: { type: "string" } }, { in: "query", name: "limit", schema: { type: "integer" } }], responses: { "200": { description: "Chunk items and next cursor" } } } },
       "/identities/{identityId}/bindings/page": { get: { summary: "List identity bindings with cursor pagination", parameters: [{ in: "path", name: "identityId", required: true, schema: { type: "string" } }, { in: "query", name: "cursor", schema: { type: "string" } }], responses: { "200": { description: "Binding items and next cursor" } } } },
       "/evidence/{edgeId}/page": { get: { summary: "List edge evidence with cursor pagination", parameters: [{ in: "path", name: "edgeId", required: true, schema: { type: "string" } }, { in: "query", name: "cursor", schema: { type: "string" } }], responses: { "200": { description: "Evidence items and next cursor" } } } },
-      "/graph/search/page": { post: { summary: "Search graph nodes with ID cursor pagination", responses: { "200": { description: "Node results and next cursor" } } } },
-      "/query/page": { post: { summary: "Search knowledge with ID cursor pagination", responses: { "200": { description: "Ranked results and next cursor" } } } },
+      "/graph/search/page": { post: { summary: "Browse ranked graph results", responses: { "200": { description: "Node results and next cursor" } } } },
+      "/query/page": { post: { summary: "Browse ranked knowledge results", responses: { "200": { description: "Ranked results and next cursor" } } } },
       "/memory/{id}": { get: { summary: "Get a memory", responses: { "200": { description: "Memory record" }, "404": { description: "Not found" } } }, delete: { summary: "Delete a memory", responses: { "204": { description: "Deleted" } } } },
       "/query": { post: { summary: "Search keyword, vector, graph, and document chunks", requestBody: { required: true, content: { "application/json": { schema: { type: "object", required: ["text"], properties: { text: { type: "string" }, search: { type: "object" }, filters: { type: "object" }, expand: { type: "object" }, includeEvidence: { type: "boolean" }, limit: { type: "integer" } } } } } }, responses: { "200": { description: "Ranked results with source provenance" } } } },
       "/ingest": { post: { summary: "Parse, chunk, embed, and index a document", responses: { "200": { description: "Stored document and chunks" } } } },
@@ -191,9 +191,6 @@ const app = new Elysia({ name: "unknown-planet-live", prefix: "/v1" })
   .get("/identities/:identityId/bindings/page", ({ params, query, client }) => client.nameId.bindings.listPage({ identityId: params.identityId, limit: query.limit ? Number(query.limit) : undefined, cursor: query.cursor }), {
     params: t.Object({ identityId: t.String() }), query: t.Object({ limit: t.Optional(t.String()), cursor: t.Optional(t.String()) }),
   })
-  .get("/identities/:identityId/bindings/page", ({ params, query, client }) => client.nameId.bindings.listPage({ identityId: params.identityId, limit: query.limit ? Number(query.limit) : undefined, cursor: query.cursor }), {
-    params: t.Object({ identityId: t.String() }), query: t.Object({ limit: t.Optional(t.String()), cursor: t.Optional(t.String()) }),
-  })
   .post("/nodes", async ({ body, client }) => {
     if (body.embedding) assertEmbeddingDimensions(body.embedding);
     const node = await client.graph.node.create({ type: body.type, name: body.name, properties: json(body.properties), embedding: body.embedding });
@@ -243,9 +240,6 @@ const app = new Elysia({ name: "unknown-planet-live", prefix: "/v1" })
   .get("/evidence/:edgeId/page", ({ params, query, client }) => client.evidence.listPage({ edgeId: params.edgeId, limit: query.limit ? Number(query.limit) : undefined, cursor: query.cursor }), {
     params: t.Object({ edgeId: t.String() }), query: t.Object({ limit: t.Optional(t.String()), cursor: t.Optional(t.String()) }),
   })
-  .get("/evidence/:edgeId/page", ({ params, query, client }) => client.evidence.listPage({ edgeId: params.edgeId, limit: query.limit ? Number(query.limit) : undefined, cursor: query.cursor }), {
-    params: t.Object({ edgeId: t.String() }), query: t.Object({ limit: t.Optional(t.String()), cursor: t.Optional(t.String()) }),
-  })
   .post("/graph/search", ({ body, client }) => client.graph.search({
     query: body.query,
     semantic: body.semantic,
@@ -253,9 +247,6 @@ const app = new Elysia({ name: "unknown-planet-live", prefix: "/v1" })
     limit: body.limit,
   }), {
     body: t.Object({ query: t.String(), semantic: t.Optional(t.Boolean()), depth: t.Optional(t.Number({ minimum: 0, maximum: 8 })), limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })) }),
-  })
-  .post("/graph/search/page", ({ body, client }) => client.graph.searchPage({ query: body.query, semantic: body.semantic, graph: { depth: body.depth ?? 0 }, limit: body.limit, cursor: body.cursor }), {
-    body: t.Object({ query: t.String(), semantic: t.Optional(t.Boolean()), depth: t.Optional(t.Number({ minimum: 0, maximum: 8 })), limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })), cursor: t.Optional(t.String()) }),
   })
   .post("/graph/search/page", ({ body, client }) => client.graph.searchPage({ query: body.query, semantic: body.semantic, graph: { depth: body.depth ?? 0 }, limit: body.limit, cursor: body.cursor }), {
     body: t.Object({ query: t.String(), semantic: t.Optional(t.Boolean()), depth: t.Optional(t.Number({ minimum: 0, maximum: 8 })), limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })), cursor: t.Optional(t.String()) }),
@@ -276,9 +267,6 @@ const app = new Elysia({ name: "unknown-planet-live", prefix: "/v1" })
   .delete("/memory/:id", async ({ params, client, set }) => { const deleted = await client.memory.delete(params.id); if (!deleted) throw new PlanetNotFoundError(`Memory '${params.id}' was not found in this scope.`); set.status = 204; return null; }, { params: t.Object({ id: t.String() }) })
   .post("/query", ({ body, client }) => client.query({ text: body.text, search: body.search, filters: body.filters, expand: body.expand, includeEvidence: body.includeEvidence, limit: body.limit, asOf: toDate(body.asOf) }), {
     body: t.Object({ text: t.String({ minLength: 1 }), search: t.Optional(t.Object({ keyword: t.Optional(t.Boolean()), vector: t.Optional(t.Boolean()), graph: t.Optional(t.Boolean()) })), filters: t.Optional(t.Object({ nodeType: t.Optional(t.String()), metadata: t.Optional(t.Record(t.String(), t.Any())), agentId: t.Optional(t.String()), documentId: t.Optional(t.String()) })), expand: t.Optional(t.Object({ relationDepth: t.Optional(t.Number({ minimum: 0, maximum: 8 })) })), includeEvidence: t.Optional(t.Boolean()), limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })), asOf: t.Optional(t.String()) }),
-  })
-  .post("/query/page", ({ body, client }) => client.queryPage({ text: body.text, search: body.search, filters: body.filters, expand: body.expand, includeEvidence: body.includeEvidence, limit: body.limit, asOf: toDate(body.asOf), cursor: body.cursor }), {
-    body: t.Object({ text: t.String({ minLength: 1 }), search: t.Optional(t.Object({ keyword: t.Optional(t.Boolean()), vector: t.Optional(t.Boolean()), graph: t.Optional(t.Boolean()) })), filters: t.Optional(t.Object({ nodeType: t.Optional(t.String()), metadata: t.Optional(t.Record(t.String(), t.Any())), agentId: t.Optional(t.String()), documentId: t.Optional(t.String()) })), expand: t.Optional(t.Object({ relationDepth: t.Optional(t.Number({ minimum: 0, maximum: 8 })) })), includeEvidence: t.Optional(t.Boolean()), limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })), asOf: t.Optional(t.String()), cursor: t.Optional(t.String()) }),
   })
   .post("/query/page", ({ body, client }) => client.queryPage({ text: body.text, search: body.search, filters: body.filters, expand: body.expand, includeEvidence: body.includeEvidence, limit: body.limit, asOf: toDate(body.asOf), cursor: body.cursor }), {
     body: t.Object({ text: t.String({ minLength: 1 }), search: t.Optional(t.Object({ keyword: t.Optional(t.Boolean()), vector: t.Optional(t.Boolean()), graph: t.Optional(t.Boolean()) })), filters: t.Optional(t.Object({ nodeType: t.Optional(t.String()), metadata: t.Optional(t.Record(t.String(), t.Any())), agentId: t.Optional(t.String()), documentId: t.Optional(t.String()) })), expand: t.Optional(t.Object({ relationDepth: t.Optional(t.Number({ minimum: 0, maximum: 8 })) })), includeEvidence: t.Optional(t.Boolean()), limit: t.Optional(t.Number({ minimum: 1, maximum: 100 })), asOf: t.Optional(t.String()), cursor: t.Optional(t.String()) }),

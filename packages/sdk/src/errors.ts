@@ -9,6 +9,9 @@ export class PlanetValidationError extends PlanetError { constructor(message: st
 export class PlanetNotFoundError extends PlanetError { constructor(message: string) { super(message, "not_found", 404); } }
 export class PlanetConflictError extends PlanetError { constructor(message: string) { super(message, "conflict", 409); } }
 export class PlanetCapabilityError extends PlanetError { constructor(capability: string) { super(`Planet was created without a ${capability} provider.`, "capability_unavailable", 503); } }
+export class PlanetFeatureDisabledError extends PlanetError {
+  constructor(capability: string, operation: string) { super(`The '${capability}' feature is disabled for this scope (${operation}).`, "feature_disabled", 403); }
+}
 export class PlanetEmbeddingNotConfiguredError extends PlanetError {
   constructor() { super("This operation requires embeddings. Configure PlanetConfig.embeddings.", "embedding_not_configured", 503); }
 }

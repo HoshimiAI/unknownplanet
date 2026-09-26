@@ -32,7 +32,7 @@ Work in priority order. Completed items record shipped scope; unchecked entries 
 - [x] Compensate terminally failed document jobs by removing chunks/vectors, source evidence, graph links, and the document record where adapters support deletion; cleanup failures are appended to the durable job error.
 - [x] Add typed `PlanetError` subclasses and map typed errors to consistent HTTP error envelopes; missing capability failures use the typed 503 error.
 - [x] Raise typed validation/not-found/conflict/provider errors across SDK adapter calls; map PostgreSQL and Mongo conflict/validation codes at the provider boundary.
-- [x] Add ID-keyset cursor pages for memory search, document chunks, graph/vector search, hybrid query, evidence, identities, bindings, and graph merge history. Matching HTTP page routes cover the exposed list/search endpoints; pages order by stable IDs rather than relevance scores.
+- [x] Add cursor pages for memory search, document chunks, graph/vector search, hybrid query, evidence, identities, bindings, and graph merge history. Graph, vector, and hybrid search pages preserve ranking within a bounded result window; record-list pages use stable IDs.
 - [x] Put HTTP routes and matching OpenAPI paths under `/v1` and update API docs.
 - [x] Classify storage adapter, embedding, extraction, and document parser failures in the SDK; HTTP returns the typed status/code envelope.
 

@@ -39,7 +39,7 @@ const record = await planet.memory.persist({
 });
 ```
 
-`persist` writes directly through MemoryStore and does not create vectors or graph nodes. It still validates required agent/content and score bounds. The memory delete workflow assumes graph/vector integration; for raw persisted records, use the configured store's deletion path or ensure corresponding graph and vector adapters/records exist before calling `planet.memory.delete`.
+`persist` writes directly through MemoryStore and does not create vectors or graph nodes. It still validates required agent/content and score bounds. Delete the record through `planet.memory.delete`; Planet removes the stored record and removes matching graph/vector records when those providers and records exist.
 
 ## Retrieve safely
 
@@ -55,7 +55,9 @@ const relevant = await planet.memory.search({
 
 Memory search uses lexical results and adds semantic results when embeddings and vector routing are available. It filters candidates by agent/user/session/type and metadata. Use all applicable owner filters; do not rely on natural-language text to enforce user isolation. Scope is applied separately through the Planet client.
 
-`get`, `searchPage`, and `delete` support lifecycle management. Cursor pagination requires a MemoryStore that implements `searchPage`.
+To add application fields, use memory `metadata` and optional `validationSchemas`. To use a different PostgreSQL schema or a custom `MemoryStore`, see [Custom application data](/docs/guides/custom-data). An application-owned SQL table queried through `planet.custom.sql` is separate from Planet memory search unless your application explicitly links or indexes its rows.
+
+`get`, `searchPage`, and `delete` support lifecycle management. Cursor pagination requires a MemoryStore that implements `searchPage`. A record written with `memory.persist` can be deleted through `planet.memory.delete` even when graph and vector providers are absent. If a matching indexed memory node exists, deletion also removes its graph and vector records.
 
 ## HTTP API
 

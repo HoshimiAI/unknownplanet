@@ -6,4 +6,8 @@ export * from "./contracts/ingestion.js";
 export * from "./contracts/evidence.js";
 export * from "./contracts/memory.js";
 export * from "./contracts/identity.js";
+export * from "./contracts/queue.js";
+export * from "./contracts/stack.js";
+export * from "./contracts/key-value.js";
 export * from "./contracts/provider.js";
+export * from "./contracts/collection.js";

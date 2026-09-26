@@ -1,24 +1,25 @@
 import type {
   AddEvidenceInput, AddMemoryInput, BlobStorageAdapter, CreateDocumentInput, CreateEdgeInput, CreateNodeInput,
-  DataLayerProvider, DocumentStore, EmbeddingProvider, EntityExtractor, EvidenceListInput, EvidenceStore, GraphNode, JsonObject,
+  CollectionStore, DataLayerProvider, DocumentStore, EmbeddingProvider, EntityExtractor, EvidenceListInput, EvidenceStore, GraphNode, JsonObject, JsonValue,
   DocumentChunkStore, DocumentParser, GraphStore, IdentityStore, MemoryRecord, MemorySearchInput, MemoryStore, PlanetScope, ProviderCapability, ProviderOperation,
-  IngestionCheckpoint, IngestionJob, IngestionJobStore, NodeMergeRecord, PlanetIdentity, IdentityBinding, ProviderRouting, ProviderRoutingPolicy, SqlStore, SqlTransaction, VectorCollectionConfig, VectorSearchInput, VectorStore,
+  IngestionCheckpoint, IngestionJob, IngestionJobStore, ProviderRouting, ProviderRoutingPolicy, QueueStore, StackStore, KeyValueStore, SqlStore, SqlTransaction, VectorCollectionConfig, VectorSearchInput, VectorStore,
 } from "@unknown-planet/core";
 import { EmbeddingDimensionMismatchError } from "@unknown-planet/core";
 import { withProviderSpan, withSpan } from "../observability/telemetry.js";
 import type { SpanContext } from "@opentelemetry/api";
-import { PlanetCapabilityError, PlanetConflictError, PlanetError, PlanetNotFoundError, PlanetProviderError, PlanetValidationError } from "../errors.js";
+import { PlanetCapabilityError, PlanetConflictError, PlanetError, PlanetFeatureDisabledError, PlanetNotFoundError, PlanetProviderError, PlanetValidationError } from "../errors.js";
 import { EmbeddingService } from "./embedding.js";
 import { canonicalEntityName, entityNameSimilarity, stableUuid } from "./identity.js";
 import { decodeBase64, encodeBase64 } from "./encoding.js";
-import { decodeCursor, encodeCursor, pageById } from "./pagination.js";
+import { decodeCursor, encodeCursor, pageInResultOrder } from "./pagination.js";
 import { queryKnowledge as runKnowledgeQuery } from "./query.js";
 import { searchGraph as runGraphSearch } from "./graph-search.js";
 import { ingestDocumentCore as runDocumentIngestion } from "./ingestion/document.js";
 import { addMemoryCore as runMemoryIngestion } from "./ingestion/memory.js";
+import { validateCustomData } from "../custom-schema.js";
 import type { KnowledgeIngestionContext } from "./ingestion/context.js";
 import type { PlanetExtension } from "../extensions.js";
-import type { DocumentIngestInput, DocumentIngestResult, GraphSearchInput, GraphSearchResult, PlanetConfig, PlanetQueryInput, PlanetQueryResult, PlanetQueryRanker, ProviderSelector, RetrievalConfig } from "../types.js";
+import type { CustomDataKind, CustomSchemas, DocumentIngestInput, DocumentIngestResult, FeaturePolicy, GraphSearchInput, GraphSearchResult, PlanetConfig, PlanetHook, PlanetHookEvent, PlanetQueryInput, PlanetQueryResult, PlanetQueryRanker, ProviderSelector, RetrievalConfig } from "../types.js";
 
 /**
  * Storage-neutral application client. It provides deterministic graph and retrieval primitives;
@@ -29,6 +30,7 @@ export class Planet {
   private readonly routing: ProviderRouting;
   private readonly scope: PlanetScope;
   private readonly routingPolicy?: ProviderRoutingPolicy;
+  private readonly featurePolicy?: FeaturePolicy;
   private readonly embeddingProvider?: EmbeddingProvider;
   private readonly embeddingService: EmbeddingService;
   private readonly vectorCollections: Readonly<Record<string, VectorCollectionConfig>>;
@@ -39,8 +41,10 @@ export class Planet {
   private readonly providerSelector?: ProviderSelector;
   private readonly retrieval: RetrievalConfig;
   private readonly queryRanker?: PlanetQueryRanker;
+  private readonly hooks: readonly PlanetHook[];
+  private readonly customSchemas: CustomSchemas;
   private readonly extensionRoutes: Readonly<Record<string, string>>;
-  private readonly providerViews = new WeakMap<object, object>();
+  private readonly providerViews = new WeakMap<object, Map<string, object>>();
   private telemetryParent?: SpanContext;
 
   constructor(config: PlanetConfig) {
@@ -55,12 +59,16 @@ export class Planet {
       memories: config.memories,
       ingestionJobs: config.ingestionJobs,
       identities: config.identities,
+      queue: config.queue,
+      stack: config.stack,
+      keyValue: config.keyValue,
       blobs: config.blobs,
       sql: config.sql,
+      collections: config.collections,
       extensions: config.extensions,
     };
     this.providers = [inline, ...(config.providers ?? [])].filter((provider) =>
-      provider.graph || provider.vector || provider.documents || provider.chunks || provider.evidence || provider.memories || provider.ingestionJobs || provider.identities || provider.blobs || provider.sql || Object.keys(provider.extensions ?? {}).length > 0,
+      provider.graph || provider.vector || provider.documents || provider.chunks || provider.evidence || provider.memories || provider.ingestionJobs || provider.identities || provider.queue || provider.stack || provider.keyValue || provider.blobs || provider.sql || provider.collections || Object.keys(provider.extensions ?? {}).length > 0,
     );
     const ids = new Set<string>();
     for (const provider of this.providers) {
@@ -69,10 +77,13 @@ export class Planet {
     }
     this.providerSelector = config.selectProvider;
     this.routingPolicy = config.routingPolicy;
+    this.featurePolicy = config.featurePolicy;
     this.routing = config.routing ?? {};
     this.scope = config.scope ?? { tenantId: "default" };
     this.retrieval = config.retrieval ?? {};
     this.queryRanker = config.queryRanker;
+    this.hooks = config.hooks ?? [];
+    this.customSchemas = config.validationSchemas ?? config.customSchemas ?? {};
     this.extensionRoutes = this.routing.extensions ?? {};
     if (this.retrieval.graphDecay !== undefined && (this.retrieval.graphDecay < 0 || this.retrieval.graphDecay > 1)) {
       throw new PlanetValidationError("retrieval.graphDecay must be between 0 and 1.");
@@ -88,9 +99,10 @@ export class Planet {
     if (this.embeddingEntityThreshold < 0 || this.embeddingEntityThreshold > 1) throw new PlanetValidationError("entityResolution.embeddingThreshold must be between 0 and 1.");
   }
 
-  readonly graph = {
+  readonly graph = this.instrumentApi("graph", {
     node: {
       create: (input: CreateNodeInput) => {
+        this.validateCustom("graph.node", input.properties, input.type);
         if (input.embedding) this.embeddingService.validate(input.embedding, this.retrieval.nodeNamespace ?? "node", this.embeddingProvider?.model);
         return this.requireGraph("write").createNode({ ...input, scope: this.scope });
       },
@@ -106,6 +118,9 @@ export class Planet {
         if (!graph.mergeNodes) throw new PlanetCapabilityError("transactional graph merge support");
         const [source, target] = await Promise.all([graph.getNode(input.sourceId, this.scope), graph.getNode(input.targetId, this.scope)]);
         if (!source || !target) throw new PlanetNotFoundError("Both source and target nodes must exist in this scope.");
+        const sourceAliases = Array.isArray(source.properties.aliases) ? source.properties.aliases.filter((value): value is string => typeof value === "string") : [];
+        const targetAliases = Array.isArray(target.properties.aliases) ? target.properties.aliases.filter((value): value is string => typeof value === "string") : [];
+        this.validateCustom("graph.node", { ...target.properties, aliases: [...new Set([...targetAliases, source.name, ...sourceAliases])] }, target.type);
         return graph.mergeNodes({ ...input, scope: this.scope });
       },
       merges: (input: { nodeId?: string; limit?: number } = {}) => {
@@ -114,40 +129,34 @@ export class Planet {
         return graph.listMerges({ ...input, scope: this.scope });
       },
       mergesPage: async (input: { nodeId?: string; limit?: number; cursor?: string } = {}) => {
-        const graph = this.requireGraph("read"); if (!graph.listMerges) throw new PlanetCapabilityError("graph merge history");
-        const results = await graph.listMerges({ nodeId: input.nodeId, limit: 100000, scope: this.scope });
-        return pageById<NodeMergeRecord>(results, input.cursor, Math.max(1, Math.min(input.limit ?? 100, 500)), (item) => item.sourceId);
+        const graph = this.requireGraph("read"); if (!graph.listMergesPage) throw new PlanetCapabilityError("cursor pagination on graph merge history");
+        const page = await graph.listMergesPage({ nodeId: input.nodeId, afterSourceId: decodeCursor(input.cursor), limit: Math.max(1, Math.min(input.limit ?? 100, 500)), scope: this.scope });
+        return { items: page.items, nextCursor: page.hasMore && page.items.length ? encodeCursor(page.items.at(-1)!.sourceId) : undefined };
       },
     },
     edge: {
-      create: (input: CreateEdgeInput) => this.requireGraph("write").createEdge({ ...input, scope: this.scope }),
+      create: (input: CreateEdgeInput) => { this.validateCustom("graph.edge", input.properties, input.relation); return this.requireGraph("write").createEdge({ ...input, scope: this.scope }); },
       get: (id: string) => this.requireGraph("read").getEdge(id, this.scope),
       update: (id: string, input: Parameters<GraphStore["updateEdge"]>[1]) => this.requireGraph("write").updateEdge(id, { ...input, scope: this.scope }),
       delete: (id: string) => this.requireGraph("write").deleteEdge(id, this.scope),
     },
     traverse: (input: Parameters<GraphStore["traverse"]>[0]) => this.requireGraph("read").traverse({ ...input, scope: this.scope }),
     search: (input: GraphSearchInput) => this.searchGraph(input),
-    searchPage: async (input: GraphSearchInput & { cursor?: string }) => pageById(await this.searchGraph({ ...input, limit: 100000 }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.node.id),
-  };
+    searchPage: async (input: GraphSearchInput & { cursor?: string }) => pageInResultOrder(await this.searchGraph({ ...input, limit: 500 }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.node.id),
+  });
 
-  readonly memory = {
-    add: (input: AddMemoryInput) => withSpan("planet.memory.add", {}, () => this.addMemory(input), this.telemetryParent),
+  readonly memory = this.instrumentApi("memory", {
+    add: (input: AddMemoryInput) => { this.validateCustom("memory", input.metadata); return withSpan("planet.memory.add", {}, () => this.addMemory(input), this.telemetryParent); },
     /** Persist a framework-owned memory record without running Planet embedding or graph ingestion. */
     persist: async (input: AddMemoryInput) => {
+      this.validateCustom("memory", input.metadata);
       if (!input.agentId.trim() || !input.content.trim()) throw new PlanetValidationError("Memory requires a non-empty agentId and content.");
       for (const [key, value] of [["importance", input.importance], ["confidence", input.confidence]] as const) if (value !== undefined && (!Number.isFinite(value) || value < 0 || value > 1)) throw new PlanetValidationError(`Memory ${key} must be between 0 and 1.`);
       const id = input.id ?? (input.source ? await stableUuid(`memory:${this.scope.tenantId}:${this.scope.workspaceId ?? ""}:${input.source.type}:${input.source.id}`) : crypto.randomUUID());
       return this.requireMemories("write").add({ ...input, id, content: input.content.trim(), scope: this.scope });
     },
     get: (id: string) => this.requireMemories("read").get(id, this.scope),
-    delete: async (id: string) => {
-      const current = await this.requireMemories("read").get(id, this.scope);
-      if (!current) return false;
-      await this.requireVector("write").delete({ id, namespace: "memory", scope: this.scope });
-      await this.requireVector("write").delete({ id, namespace: this.retrieval.nodeNamespace ?? "node", scope: this.scope });
-      await this.requireGraph("write").deleteNode(id, this.scope);
-      return this.requireMemories("write").delete(id, this.scope);
-    },
+    delete: (id: string) => this.deleteMemory(id),
     search: (input: MemorySearchInput) => withSpan("planet.memory.search", {}, () => this.searchMemories(input), this.telemetryParent),
     searchPage: async (input: MemorySearchInput & { cursor?: string }) => {
       const store = this.requireMemories("search");
@@ -156,17 +165,18 @@ export class Planet {
       const page = await store.searchPage({ ...input, limit, afterId: decodeCursor(input.cursor), scope: this.scope });
       return { items: page.items, nextCursor: page.hasMore && page.items.length ? encodeCursor(page.items.at(-1)!.id) : undefined };
     },
-  };
+  });
 
-  readonly query = (input: PlanetQueryInput) => withSpan("planet.query", { "unknownplanet.search.keyword": input.search?.keyword ?? true, "unknownplanet.search.vector": input.search?.vector ?? true, "unknownplanet.search.graph": input.search?.graph ?? true }, () => this.queryKnowledge(input), this.telemetryParent);
-  readonly queryPage = async (input: PlanetQueryInput & { cursor?: string }) => withSpan("planet.query.page", {}, async () => pageById(await this.queryKnowledge({ ...input, limit: 100000 }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.node.id), this.telemetryParent);
-  readonly ingestion = {
+  readonly query = (input: PlanetQueryInput) => this.withHook("query", () => withSpan("planet.query", { "unknownplanet.search.keyword": input.search?.keyword ?? true, "unknownplanet.search.vector": input.search?.vector ?? true, "unknownplanet.search.graph": input.search?.graph ?? true }, () => this.queryKnowledge(input), this.telemetryParent));
+  readonly queryPage = (input: PlanetQueryInput & { cursor?: string }) => this.withHook("queryPage", () => withSpan("planet.query.page", {}, async () => pageInResultOrder(await this.queryKnowledge({ ...input, limit: 500 }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.node.id), this.telemetryParent));
+  readonly ingestion = this.instrumentApi("ingestion", {
     get: (id: string) => this.requireIngestionJobs("read").get(id, this.scope),
     runDue: (input: { limit?: number; leaseMs?: number } = {}) => withSpan("planet.ingestion.run_due", {}, () => this.runDueIngestion(input), this.telemetryParent),
-  };
+  });
 
-  readonly vector = {
+  readonly vector = this.instrumentApi("vector", {
     upsert: (input: Parameters<VectorStore["upsert"]>[0]) => {
+      this.validateCustom("vector", input.metadata);
       this.embeddingService.validate(input.embedding, input.namespace, input.model);
       return this.requireVector("write").upsert({ ...input, model: input.model ?? this.embeddingProvider?.model ?? this.vectorCollections[input.namespace]?.model, scope: this.scope });
     },
@@ -178,16 +188,16 @@ export class Planet {
     searchPage: async (input: VectorSearchInput & { cursor?: string }) => {
       this.embeddingService.validate(input.embedding, input.namespace, input.model);
       const model = input.model ?? this.embeddingProvider?.model ?? (input.namespace ? this.vectorCollections[input.namespace]?.model : undefined);
-      return pageById(await this.requireVector("search").search({ ...input, model, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.id);
+      return pageInResultOrder(await this.requireVector("search").search({ ...input, model, limit: 500, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => JSON.stringify([item.namespace, item.id]));
     },
     delete: (input: Parameters<VectorStore["delete"]>[0]) => this.requireVector("write").delete({ ...input, scope: this.scope }),
-  };
+  });
 
-  readonly document = {
-    create: (input: CreateDocumentInput) => this.requireDocuments("write").create({ ...input, scope: this.scope }),
+  readonly document = this.instrumentApi("document", {
+    create: (input: CreateDocumentInput) => { this.validateCustom("document", input.metadata); return this.requireDocuments("write").create({ ...input, scope: this.scope }); },
     get: (id: string) => this.requireDocuments("read").get(id, this.scope),
     chunk: {
-      create: (input: Parameters<DocumentChunkStore["create"]>[0]) => this.requireChunks("write").create({ ...input, scope: this.scope }),
+      create: (input: Parameters<DocumentChunkStore["create"]>[0]) => { this.validateCustom("chunk", input.metadata); return this.requireChunks("write").create({ ...input, scope: this.scope }); },
       get: (id: string) => this.requireChunks("read").get(id, this.scope),
       list: (input: Parameters<DocumentChunkStore["list"]>[0]) => this.requireChunks("read").list({ ...input, scope: this.scope }),
       listPage: async (input: { documentId: string; limit?: number; cursor?: string }) => {
@@ -198,14 +208,20 @@ export class Planet {
         return { items: page.items, nextCursor: page.hasMore && page.items.length ? encodeCursor(page.items.at(-1)!.id) : undefined };
       },
       search: (input: Parameters<DocumentChunkStore["search"]>[0]) => this.requireChunks("search").search({ ...input, scope: this.scope }),
-      searchPage: async (input: { query: string; limit?: number; cursor?: string }) => pageById(await this.requireChunks("search").search({ query: input.query, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 20, 500)), (item) => item.id),
+      searchPage: async (input: { query: string; limit?: number; cursor?: string }) => {
+        const store = this.requireChunks("search");
+        if (!store.searchPage) throw new PlanetCapabilityError("cursor search pagination on DocumentChunkStore");
+        const page = await store.searchPage({ query: input.query, afterId: decodeCursor(input.cursor), limit: Math.max(1, Math.min(input.limit ?? 20, 500)), scope: this.scope });
+        return { items: page.items, nextCursor: page.hasMore && page.items.length ? encodeCursor(page.items.at(-1)!.id) : undefined };
+      },
       deleteExcept: (input: Parameters<DocumentChunkStore["deleteExcept"]>[0]) => this.requireChunks("write").deleteExcept({ ...input, scope: this.scope }),
     },
-    ingest: (input: DocumentIngestInput) => withSpan("planet.document.ingest", { "unknownplanet.document.content_type": input.contentType }, () => this.ingestDocument(input), this.telemetryParent),
-  };
+    ingest: (input: DocumentIngestInput) => { this.validateCustom("document", input.metadata as unknown as JsonObject | undefined); return withSpan("planet.document.ingest", { "unknownplanet.document.content_type": input.contentType }, () => this.ingestDocument(input), this.telemetryParent); },
+  });
 
-  readonly evidence = {
+  readonly evidence = this.instrumentApi("evidence", {
     add: async (input: AddEvidenceInput) => {
+      this.validateCustom("evidence", input.metadata);
       const saved = await this.requireEvidence("write").add({ ...input, scope: this.scope });
       const edge = await this.requireGraph("read").getEdge(input.edgeId, this.scope);
       if (edge && input.direction !== "neutral") {
@@ -218,31 +234,79 @@ export class Planet {
       return saved;
     },
     list: (input: Parameters<EvidenceStore["list"]>[0]) => this.requireEvidence("read").list({ ...input, scope: this.scope }),
-    listPage: async (input: EvidenceListInput & { cursor?: string }) => pageById(await this.requireEvidence("read").list({ ...input, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 100, 500)), (item) => item.id),
-  };
+    listPage: async (input: EvidenceListInput & { cursor?: string }) => {
+      const store = this.requireEvidence("read");
+      if (!store.listPage) throw new PlanetCapabilityError("cursor pagination on EvidenceStore");
+      const page = await store.listPage({ ...input, afterId: decodeCursor(input.cursor), limit: Math.max(1, Math.min(input.limit ?? 100, 500)), scope: this.scope });
+      return { items: page.items, nextCursor: page.hasMore && page.items.length ? encodeCursor(page.items.at(-1)!.id) : undefined };
+    },
+  });
 
-  readonly nameId = {
-    create: (input: Parameters<IdentityStore["create"]>[0]) => this.requireIdentities("write").create({ ...input, scope: this.scope }),
+  readonly nameId = this.instrumentApi("nameId", {
+    create: (input: Parameters<IdentityStore["create"]>[0]) => { this.validateCustom("identity", input.metadata); return this.requireIdentities("write").create({ ...input, scope: this.scope }); },
     get: (input: Parameters<IdentityStore["get"]>[0]) => this.requireIdentities("read").get({ ...input, scope: this.scope }),
     resolve: (input: Parameters<IdentityStore["resolve"]>[0]) => this.requireIdentities("read").resolve({ ...input, scope: this.scope }),
     list: (input: Parameters<IdentityStore["list"]>[0]) => this.requireIdentities("read").list({ ...input, scope: this.scope }),
-    listPage: async (input: Parameters<IdentityStore["list"]>[0] & { cursor?: string }) => pageById<PlanetIdentity>(await this.requireIdentities("read").list({ ...input, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 100, 500)), (item) => item.id),
+    listPage: async (input: Parameters<IdentityStore["list"]>[0] & { cursor?: string }) => {
+      const store = this.requireIdentities("read");
+      if (!store.listPage) throw new PlanetCapabilityError("cursor pagination on IdentityStore");
+      const page = await store.listPage({ ...input, afterId: decodeCursor(input.cursor), limit: Math.max(1, Math.min(input.limit ?? 100, 500)), scope: this.scope });
+      return { items: page.items, nextCursor: page.hasMore && page.items.length ? encodeCursor(page.items.at(-1)!.id) : undefined };
+    },
     alias: { add: (input: Parameters<IdentityStore["addAlias"]>[0]) => this.requireIdentities("write").addAlias({ ...input, scope: this.scope }) },
-    bind: (input: Parameters<IdentityStore["bind"]>[0]) => this.requireIdentities("write").bind({ ...input, scope: this.scope }),
+    bind: (input: Parameters<IdentityStore["bind"]>[0]) => { this.validateCustom("identity.binding", input.metadata); return this.requireIdentities("write").bind({ ...input, scope: this.scope }); },
     bindings: {
       list: (input: Parameters<IdentityStore["listBindings"]>[0]) => this.requireIdentities("read").listBindings({ ...input, scope: this.scope }),
-      listPage: async (input: Parameters<IdentityStore["listBindings"]>[0] & { cursor?: string }) => pageById<IdentityBinding>(await this.requireIdentities("read").listBindings({ ...input, limit: 100000, scope: this.scope }), input.cursor, Math.max(1, Math.min(input.limit ?? 100, 500)), (item) => JSON.stringify([item.identityId, item.providerId, item.resourceType, item.resourceId])),
+      listPage: async (input: Parameters<IdentityStore["listBindings"]>[0] & { cursor?: string }) => {
+        const store = this.requireIdentities("read");
+        if (!store.listBindingsPage) throw new PlanetCapabilityError("binding cursor pagination on IdentityStore");
+        let after: { providerId: string; resourceType: string; resourceId: string } | undefined;
+        const decoded = decodeCursor(input.cursor);
+        if (decoded !== undefined) {
+          try {
+            const value: unknown = JSON.parse(decoded);
+            if (!Array.isArray(value) || (value.length !== 3 && value.length !== 4) || value.some((part) => typeof part !== "string")) throw new Error("invalid");
+            if (value.length === 4 && value[0] !== input.identityId) throw new Error("identity mismatch");
+            const offset = value.length === 4 ? 1 : 0;
+            after = { providerId: value[offset], resourceType: value[offset + 1], resourceId: value[offset + 2] };
+          } catch { throw new PlanetValidationError("Binding pagination cursor is invalid."); }
+        }
+        const page = await store.listBindingsPage({ ...input, after, limit: Math.max(1, Math.min(input.limit ?? 100, 500)), scope: this.scope });
+        const last = page.items.at(-1);
+        return { items: page.items, nextCursor: page.hasMore && last ? encodeCursor(JSON.stringify([last.providerId, last.resourceType, last.resourceId])) : undefined };
+      },
     },
-  };
+  });
 
-  readonly blob = {
-    put: (input: Parameters<BlobStorageAdapter["put"]>[0]) => this.requireBlobs("write").put(input),
+  readonly blob = this.instrumentApi("blob", {
+    put: (input: Parameters<BlobStorageAdapter["put"]>[0]) => { this.validateCustom("blob", input.metadata); return this.requireBlobs("write").put(input); },
     get: (uri: string) => this.requireBlobs("read").get(uri),
+    metadata: (uri: string) => { const blobs = this.requireBlobs("read"); if (!blobs.getMetadata) throw new PlanetCapabilityError("blob metadata reads on the routed BlobStorageAdapter"); return blobs.getMetadata(uri); },
     delete: (uri: string) => this.requireBlobs("write").delete(uri),
-  };
+  });
+
+  readonly queue = this.instrumentApi("queue", {
+    send: (input: { queue: string; value: JsonValue; delayMs?: number }) => { this.validateCustom("queue", input.value); return this.requireQueue("write").enqueue({ ...input, scope: this.scope }); },
+    claim: (input: { queue: string; limit?: number; leaseMs?: number }) => this.requireQueue("write").claim({ ...input, scope: this.scope }),
+    ack: (input: { queue: string; id: string; leaseToken: string }) => this.requireQueue("write").ack({ ...input, scope: this.scope }),
+    release: (input: { queue: string; id: string; leaseToken: string; delayMs?: number }) => this.requireQueue("write").release({ ...input, scope: this.scope }),
+  });
+
+  readonly stack = this.instrumentApi("stack", {
+    push: (input: { stack: string; value: JsonValue }) => { this.validateCustom("stack", input.value); return this.requireStack("write").push({ ...input, scope: this.scope }); },
+    pop: (stack: string) => this.requireStack("write").pop({ stack, scope: this.scope }),
+    peek: (stack: string) => this.requireStack("read").peek({ stack, scope: this.scope }),
+    size: (stack: string) => this.requireStack("read").size({ stack, scope: this.scope }),
+  });
+
+  readonly kv = this.instrumentApi("kv", {
+    get: (input: { key: string; namespace?: string }) => this.requireKeyValue("read").get({ ...input, scope: this.scope }),
+    set: (input: { key: string; value: JsonValue; namespace?: string; ttlMs?: number }) => { this.validateCustom("keyValue", input.value); return this.requireKeyValue("write").set({ ...input, scope: this.scope }); },
+    delete: (input: { key: string; namespace?: string }) => this.requireKeyValue("write").delete({ ...input, scope: this.scope }),
+  });
 
   /** Execute parameterized SQL against the routed relational provider. */
-  readonly sql = {
+  readonly sql = this.instrumentApi("sql", {
     query: <T extends Record<string, unknown> = Record<string, unknown>>(input: Parameters<SqlStore["query"]>[0]) => this.requireSql("read").query<T>(input),
     /** Execute a write statement against the provider selected for write operations. */
     execute: <T extends Record<string, unknown> = Record<string, unknown>>(input: Parameters<SqlStore["query"]>[0]) => this.requireSql("write").query<T>(input),
@@ -251,7 +315,26 @@ export class Planet {
       if (!store.transaction) throw new PlanetCapabilityError("transaction support on the routed SqlStore");
       return store.transaction(work);
     },
-  };
+  });
+
+  /** Query application-owned structures after the application has migrated its database. */
+  readonly custom = this.instrumentApi("custom", {
+    sql: {
+      query: <T extends Record<string, unknown> = Record<string, unknown>>(input: Parameters<SqlStore["query"]>[0]) => this.requireSql("read").query<T>(input),
+      execute: <T extends Record<string, unknown> = Record<string, unknown>>(input: Parameters<SqlStore["query"]>[0]) => this.requireSql("write").query<T>(input),
+      transaction: <T>(work: (transaction: SqlTransaction) => Promise<T>) => {
+        const store = this.requireSql("transaction");
+        if (!store.transaction) throw new PlanetCapabilityError("transaction support on the routed SqlStore");
+        return store.transaction(work);
+      },
+    },
+    collection: {
+      find: <T extends Record<string, unknown> = Record<string, unknown>>(input: Parameters<CollectionStore["find"]>[0]) => this.requireCollections("read").find<T>(input),
+      insertOne: (input: Parameters<CollectionStore["insertOne"]>[0]) => this.requireCollections("write").insertOne(input),
+      updateOne: (input: Parameters<CollectionStore["updateOne"]>[0]) => this.requireCollections("write").updateOne(input),
+      deleteOne: (input: Parameters<CollectionStore["deleteOne"]>[0]) => this.requireCollections("write").deleteOne(input),
+    },
+  });
 
   /**
    * Retrieves an application-defined provider extension without adding it to the core SDK.
@@ -274,18 +357,18 @@ export class Planet {
 
   /** Returns a client using the same providers with a different capability routing policy. */
   withRouting(routing: ProviderRouting): Planet {
-    return new Planet({ providers: this.providers, routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
+    return new Planet({ providers: this.providers, routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, featurePolicy: this.featurePolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker, hooks: this.hooks, validationSchemas: this.customSchemas });
   }
 
   /** Returns a client with additional adapters. Existing provider ids remain protected from duplicates. */
   withProviders(providers: DataLayerProvider[], routing?: ProviderRouting): Planet {
-    return new Planet({ providers: [...this.providers, ...providers], routing: routing ?? this.routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
+    return new Planet({ providers: [...this.providers, ...providers], routing: routing ?? this.routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, featurePolicy: this.featurePolicy, scope: this.scope, retrieval: this.retrieval, queryRanker: this.queryRanker, hooks: this.hooks, validationSchemas: this.customSchemas });
   }
 
   /** Returns an isolated client for one tenant or tenant/workspace request. */
   withScope(scope: PlanetScope, parentSpanContext?: SpanContext): Planet {
     if (!scope.tenantId.trim()) throw new PlanetValidationError("Planet scope requires a tenantId.");
-    const scoped = new Planet({ providers: this.providers, routing: this.routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, scope, retrieval: this.retrieval, queryRanker: this.queryRanker });
+    const scoped = new Planet({ providers: this.providers, routing: this.routing, embeddings: this.embeddingProvider, vectorCollections: this.vectorCollections, extractor: this.entityExtractor, documentParsers: this.documentParsers, entityResolution: { fuzzyThreshold: this.fuzzyEntityThreshold, embeddingThreshold: this.embeddingEntityThreshold }, selectProvider: this.providerSelector, routingPolicy: this.routingPolicy, featurePolicy: this.featurePolicy, scope, retrieval: this.retrieval, queryRanker: this.queryRanker, hooks: this.hooks, validationSchemas: this.customSchemas });
     scoped.telemetryParent = parentSpanContext;
     return scoped;
   }
@@ -294,6 +377,7 @@ export class Planet {
     capability: K,
     operation: ProviderOperation,
   ): NonNullable<DataLayerProvider[K]> | undefined {
+    if (this.featurePolicy?.({ capability, operation, scope: this.scope }) === false) throw new PlanetFeatureDisabledError(capability, operation);
     const configuredId = this.routing[capability];
     const selectedId = configuredId ?? this.routingPolicy?.({ capability, operation, scope: this.scope, providers: this.providers }) ?? this.providerSelector?.({ capability, providers: this.providers });
     const provider = selectedId ? this.providers.find((item) => item.id === selectedId) : this.providers.find((item) => item[capability]);
@@ -303,20 +387,109 @@ export class Planet {
     return store ? this.providerView(capability, store as object) as NonNullable<DataLayerProvider[K]> : undefined;
   }
 
+  private instrumentApi<T extends Record<string, unknown>>(prefix: string, api: T): T {
+    const wrapped = Object.fromEntries(Object.entries(api).map(([key, value]) => {
+      const operation = `${prefix}.${key}`;
+      if (typeof value === "function") {
+        const invoke = value as (...args: unknown[]) => unknown;
+        return [key, (...args: unknown[]) => this.withHook(operation, () => Promise.resolve(invoke(...args)))];
+      }
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        return [key, this.instrumentApi(operation, value as Record<string, unknown>)];
+      }
+      return [key, value];
+    }));
+    return wrapped as T;
+  }
+
+  private async withHook<T>(operation: string, action: () => Promise<T>): Promise<T> {
+    await this.emitHook({ operation, phase: "started" });
+    const startedAt = Date.now();
+    try {
+      const result = await action();
+      await this.emitHook({ operation, phase: "completed", durationMs: Date.now() - startedAt });
+      return result;
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error("Unknown operation failure.");
+      await this.emitHook({ operation, phase: "failed", durationMs: Date.now() - startedAt, error: { name: failure.name, ...(failure instanceof PlanetError ? { code: failure.code } : {}) } });
+      throw error;
+    }
+  }
+
+  private async emitHook(event: PlanetHookEvent): Promise<void> {
+    for (const hook of this.hooks) {
+      try { await hook(event); } catch { /* Hooks are observational and cannot change operation outcomes. */ }
+    }
+  }
+
+  private validateCustom(kind: CustomDataKind, value: JsonValue | undefined, variant?: string): void {
+    validateCustomData(this.customSchemas[kind], value, kind);
+    if (variant !== undefined && (kind === "graph.node" || kind === "graph.edge")) {
+      const key = `${kind}:${variant}` as keyof CustomSchemas;
+      validateCustomData(this.customSchemas[key], value, key);
+    }
+  }
+
+  private hasGraphSchema(kind: "graph.node" | "graph.edge"): boolean {
+    return Object.keys(this.customSchemas).some((key) => key === kind || key.startsWith(`${kind}:`));
+  }
+
+  private async validateProviderWrite(capability: string, method: string, store: object, args: unknown[]): Promise<void> {
+    if (capability === "graph") {
+      const graph = store as GraphStore;
+      if (method === "createNode") {
+        const input = args[0] as CreateNodeInput;
+        this.validateCustom("graph.node", input.properties, input.type);
+      } else if (method === "createEdge") {
+        const input = args[0] as CreateEdgeInput;
+        this.validateCustom("graph.edge", input.properties, input.relation);
+      } else if (method === "updateNode" && this.hasGraphSchema("graph.node")) {
+        const input = args[1] as Parameters<GraphStore["updateNode"]>[1];
+        const current = await graph.getNode(args[0] as string, input.scope);
+        if (current) this.validateCustom("graph.node", input.properties ?? current.properties, input.type ?? current.type);
+      } else if (method === "updateEdge" && this.hasGraphSchema("graph.edge")) {
+        const input = args[1] as Parameters<GraphStore["updateEdge"]>[1];
+        const current = await graph.getEdge(args[0] as string, input.scope);
+        if (current) this.validateCustom("graph.edge", input.properties ?? current.properties, current.relation);
+      }
+      return;
+    }
+    const input = args[0] as Record<string, unknown> | undefined;
+    if (!input) return;
+    const metadata = input.metadata as JsonValue | undefined;
+    if (capability === "vector" && method === "upsert") this.validateCustom("vector", metadata);
+    else if (capability === "documents" && method === "create") this.validateCustom("document", metadata);
+    else if (capability === "chunks" && method === "create") this.validateCustom("chunk", metadata);
+    else if (capability === "evidence" && method === "add") this.validateCustom("evidence", metadata);
+    else if (capability === "memories" && method === "add") this.validateCustom("memory", metadata);
+    else if (capability === "identities" && method === "create") this.validateCustom("identity", metadata);
+    else if (capability === "identities" && method === "bind") this.validateCustom("identity.binding", metadata);
+    else if (capability === "ingestionJobs" && (method === "create" || method === "update") && input.input !== undefined) this.validateCustom("ingestionJob", input.input as JsonValue);
+    else if (capability === "queue" && method === "enqueue") this.validateCustom("queue", input.value as JsonValue | undefined);
+    else if (capability === "stack" && method === "push") this.validateCustom("stack", input.value as JsonValue | undefined);
+    else if (capability === "keyValue" && method === "set") this.validateCustom("keyValue", input.value as JsonValue | undefined);
+    else if (capability === "blobs" && method === "put") this.validateCustom("blob", metadata);
+  }
+
   private providerView<T extends object>(capability: string, store: T): T {
-    const cached = this.providerViews.get(store);
+    const cached = this.providerViews.get(store)?.get(capability);
     if (cached) return cached as T;
     const view = new Proxy(store, {
       get: (target, property) => {
         const value = Reflect.get(target, property, target) as unknown;
         if (typeof value !== "function") return value;
         return (...args: unknown[]) => withProviderSpan(`store.${capability}`, String(property), async () => {
-          try { return await Reflect.apply(value, target, args); }
+          try {
+            await this.validateProviderWrite(capability, String(property), target, args);
+            return await Reflect.apply(value, target, args);
+          }
           catch (error) { throw this.classifyProviderError(capability, String(property), error); }
         });
       },
     });
-    this.providerViews.set(store, view);
+    const views = this.providerViews.get(store) ?? new Map<string, object>();
+    views.set(capability, view);
+    this.providerViews.set(store, views);
     return view;
   }
 
@@ -428,18 +601,24 @@ export class Planet {
   private requireIdentities(operation: ProviderOperation): IdentityStore {
     const store = this.resolve("identities", operation); if (!store) throw new PlanetCapabilityError("IdentityStore"); return store;
   }
+  private requireQueue(operation: ProviderOperation): QueueStore { const store = this.resolve("queue", operation); if (!store) throw new PlanetCapabilityError("QueueStore"); return store; }
+  private requireStack(operation: ProviderOperation): StackStore { const store = this.resolve("stack", operation); if (!store) throw new PlanetCapabilityError("StackStore"); return store; }
+  private requireKeyValue(operation: ProviderOperation): KeyValueStore { const store = this.resolve("keyValue", operation); if (!store) throw new PlanetCapabilityError("KeyValueStore"); return store; }
   private requireBlobs(operation: ProviderOperation): BlobStorageAdapter {
     const store = this.resolve("blobs", operation); if (!store) throw new PlanetCapabilityError("BlobStorageAdapter"); return store;
   }
   private requireSql(operation: ProviderOperation): SqlStore {
     const store = this.resolve("sql", operation); if (!store) throw new PlanetCapabilityError("SqlStore"); return store;
   }
+  private requireCollections(operation: ProviderOperation): CollectionStore {
+    const store = this.resolve("collections", operation); if (!store) throw new PlanetCapabilityError("CollectionStore"); return store;
+  }
 
   private async createGraphNode(input: CreateNodeInput): Promise<GraphNode> {
     const graph = this.requireGraph("write");
     try { return await graph.createNode({ ...input, scope: this.scope }); }
     catch (error) {
-      if (input.id) {
+      if (input.id && !(error instanceof PlanetValidationError)) {
         const concurrent = await graph.getNode(input.id, this.scope);
         if (concurrent) return concurrent;
       }
@@ -470,18 +649,29 @@ export class Planet {
     const jobs = this.resolve("ingestionJobs", "write");
     if (!jobs) return this.ingestDocumentCore(input);
     const jobId = crypto.randomUUID();
+    const inlineLimit = 256 * 1024;
+    const source = input.data.byteLength > inlineLimit ? this.resolve("blobs", "write") : undefined;
+    if (input.data.byteLength > inlineLimit && !source) throw new PlanetCapabilityError("BlobStorageAdapter for durable documents larger than 256 KiB");
+    const stored = source ? await source.put({ key: `ingestion/${jobId}`, data: input.data, contentType: input.contentType }) : undefined;
     const payload: JsonObject = {
       title: input.title,
       contentType: input.contentType,
-      dataBase64: encodeBase64(input.data),
-      contentUri: input.contentUri ?? null,
+      ...(stored ? { sourceUri: stored.uri } : { dataBase64: encodeBase64(input.data) }),
+      contentUri: input.contentUri ?? stored?.uri ?? null,
       externalId: input.externalId ?? null,
       chunkSize: input.chunkSize ?? null,
       overlap: input.overlap ?? null,
       metadata: (input.metadata ?? {}) as JsonObject,
     };
-    let job = await jobs.create({ id: jobId, kind: "document", input: payload, scope: this.scope });
-    job = await jobs.update({ id: jobId, status: "processing", attempts: 1, leaseUntil: new Date(Date.now() + 60_000), lastError: null, scope: this.scope });
+    let job: IngestionJob;
+    try {
+      this.validateCustom("ingestionJob", payload);
+      job = await jobs.create({ id: jobId, kind: "document", input: payload, scope: this.scope });
+    } catch (error) {
+      if (stored) await source!.delete(stored.uri).catch(() => undefined);
+      throw error;
+    }
+    job = await jobs.claim({ id: jobId, leaseMs: 60_000, scope: this.scope });
     return this.executeDocumentJob(job, input);
   }
 
@@ -491,8 +681,8 @@ export class Planet {
     const results: Array<{ id: string; status: string; error?: string }> = [];
     for (const job of jobs) {
       try {
-        if (job.kind === "document") await this.executeDocumentJob(job, this.documentInputFromJob(job));
-        else await this.executeMemoryJob(job, this.memoryInputFromJob(job));
+        if (job.kind === "document") await this.executeDocumentJob(job);
+        else await this.executeMemoryJob(job);
         results.push({ id: job.id, status: "succeeded" });
       }
       catch (error) { results.push({ id: job.id, status: (await store.get(job.id, this.scope))?.status ?? "failed", error: error instanceof Error ? error.message : "Ingestion failed." }); }
@@ -500,27 +690,31 @@ export class Planet {
     return { claimed: jobs.length, results };
   }
 
-  private documentInputFromJob(job: IngestionJob): DocumentIngestInput {
+  private async documentInputFromJob(job: IngestionJob): Promise<DocumentIngestInput> {
     const value = job.input;
-    if (typeof value.title !== "string" || typeof value.contentType !== "string" || typeof value.dataBase64 !== "string") throw new PlanetValidationError(`Ingestion job '${job.id}' has an invalid persisted payload.`);
-    return { title: value.title, contentType: value.contentType, data: decodeBase64(value.dataBase64), contentUri: typeof value.contentUri === "string" ? value.contentUri : undefined, externalId: typeof value.externalId === "string" ? value.externalId : undefined, chunkSize: typeof value.chunkSize === "number" ? value.chunkSize : undefined, overlap: typeof value.overlap === "number" ? value.overlap : undefined, metadata: value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata) ? value.metadata as Record<string, unknown> : undefined };
+    if (typeof value.title !== "string" || typeof value.contentType !== "string" || (typeof value.dataBase64 !== "string" && typeof value.sourceUri !== "string")) throw new PlanetValidationError(`Ingestion job '${job.id}' has an invalid persisted payload.`);
+    const data = typeof value.sourceUri === "string" ? await this.requireBlobs("read").get(value.sourceUri) : decodeBase64(value.dataBase64 as string);
+    return { title: value.title, contentType: value.contentType, data, contentUri: typeof value.contentUri === "string" ? value.contentUri : undefined, externalId: typeof value.externalId === "string" ? value.externalId : undefined, chunkSize: typeof value.chunkSize === "number" ? value.chunkSize : undefined, overlap: typeof value.overlap === "number" ? value.overlap : undefined, metadata: value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata) ? value.metadata as Record<string, unknown> : undefined };
   }
 
-  private async executeDocumentJob(job: IngestionJob, input: DocumentIngestInput): Promise<DocumentIngestResult> {
+  private async executeDocumentJob(job: IngestionJob, input?: DocumentIngestInput): Promise<DocumentIngestResult> {
     const store = this.requireIngestionJobs("write");
-    const checkpoint = async (value: IngestionCheckpoint) => { await store.update({ id: job.id, checkpoint: value, leaseUntil: new Date(Date.now() + 60_000), scope: this.scope }); };
-    const heartbeat = setInterval(() => { void store.update({ id: job.id, leaseUntil: new Date(Date.now() + 60_000), scope: this.scope }).catch(() => undefined); }, 20_000);
+    if (!job.leaseToken) throw new PlanetProviderError("document ingestion lease", new Error("Claimed job has no lease token."));
+    const expectedLeaseToken = job.leaseToken;
+    const checkpoint = async (value: IngestionCheckpoint, documentId?: string) => { await store.update({ id: job.id, checkpoint: value, ...(documentId ? { input: { ...job.input, documentId } } : {}), leaseUntil: new Date(Date.now() + 60_000), expectedLeaseToken, scope: this.scope }); if (documentId) job.input.documentId = documentId; };
+    const heartbeat = setInterval(() => { void store.update({ id: job.id, leaseUntil: new Date(Date.now() + 60_000), expectedLeaseToken, scope: this.scope }).catch(() => undefined); }, 20_000);
     try {
-      const result = await this.ingestDocumentCore(input, checkpoint);
-      await store.update({ id: job.id, status: "succeeded", checkpoint: "completed", leaseUntil: null, lastError: null, scope: this.scope });
+      const result = await this.ingestDocumentCore(input ?? await this.documentInputFromJob(job), checkpoint);
+      await store.update({ id: job.id, status: "succeeded", checkpoint: "completed", leaseUntil: null, leaseToken: null, expectedLeaseToken, lastError: null, scope: this.scope });
       return { ...result, jobId: job.id };
     } catch (error) {
       const failure = error instanceof PlanetError ? error : new PlanetProviderError("document ingestion", error);
       const attempts = Math.max(job.attempts, 1); const retry = attempts < job.maxAttempts && !(failure instanceof PlanetValidationError);
-      try { await store.update({ id: job.id, status: retry ? "retry_wait" : "failed", nextAttemptAt: retry ? new Date(Date.now() + Math.min(3_600_000, 1000 * 2 ** attempts)) : undefined, leaseUntil: null, lastError: failure.message.slice(0, 2000), scope: this.scope }); } catch { /* preserve the original failure; the lease allows recovery if status persistence failed */ }
-      if (!retry && typeof job.input.documentId === "string") {
+      let failureRecorded = false;
+      try { await store.update({ id: job.id, status: retry ? "retry_wait" : "failed", nextAttemptAt: retry ? new Date(Date.now() + Math.min(3_600_000, 1000 * 2 ** attempts)) : undefined, leaseUntil: null, leaseToken: null, expectedLeaseToken, lastError: failure.message.slice(0, 2000), scope: this.scope }); failureRecorded = true; } catch { /* preserve the original failure; the lease allows recovery if status persistence failed */ }
+      if (failureRecorded && !retry && typeof job.input.documentId === "string") {
         const cleanupErrors = await this.cleanupFailedDocument(job.input.documentId);
-        if (cleanupErrors.length) try { await store.update({ id: job.id, lastError: `${failure.message}; cleanup incomplete: ${cleanupErrors.join("; ")}`.slice(0, 2000), scope: this.scope }); } catch { /* Retain the original job error. */ }
+        if (cleanupErrors.length) failure.message = `${failure.message}; cleanup incomplete: ${cleanupErrors.join("; ")}`.slice(0, 2000);
       }
       Object.assign(failure, { ingestionJobId: job.id });
       throw failure;
@@ -533,22 +727,25 @@ export class Planet {
     return { id: typeof value.memoryId === "string" ? value.memoryId : undefined, agentId: value.agentId, content: value.content, type: typeof value.type === "string" ? value.type as AddMemoryInput["type"] : undefined, userId: typeof value.userId === "string" ? value.userId : undefined, sessionId: typeof value.sessionId === "string" ? value.sessionId : undefined, importance: typeof value.importance === "number" ? value.importance : undefined, confidence: typeof value.confidence === "number" ? value.confidence : undefined, source: value.source && typeof value.source === "object" && !Array.isArray(value.source) ? value.source as unknown as AddMemoryInput["source"] : undefined, metadata: value.metadata && typeof value.metadata === "object" && !Array.isArray(value.metadata) ? value.metadata as JsonObject : undefined };
   }
 
-  private async executeMemoryJob(job: IngestionJob, input: AddMemoryInput): Promise<MemoryRecord> {
+  private async executeMemoryJob(job: IngestionJob, input?: AddMemoryInput): Promise<MemoryRecord> {
     const store = this.requireIngestionJobs("write");
-    const checkpoint = async (value: IngestionCheckpoint, documentId?: string) => { await store.update({ id: job.id, checkpoint: value, ...(documentId ? { input: { ...job.input, documentId } } : {}), leaseUntil: new Date(Date.now() + 60_000), scope: this.scope }); if (documentId) job.input.documentId = documentId; };
-    const heartbeat = setInterval(() => { void store.update({ id: job.id, leaseUntil: new Date(Date.now() + 60_000), scope: this.scope }).catch(() => undefined); }, 20_000);
+    if (!job.leaseToken) throw new PlanetProviderError("memory ingestion lease", new Error("Claimed job has no lease token."));
+    const expectedLeaseToken = job.leaseToken;
+    const checkpoint = async (value: IngestionCheckpoint, documentId?: string) => { await store.update({ id: job.id, checkpoint: value, ...(documentId ? { input: { ...job.input, documentId } } : {}), leaseUntil: new Date(Date.now() + 60_000), expectedLeaseToken, scope: this.scope }); if (documentId) job.input.documentId = documentId; };
+    const heartbeat = setInterval(() => { void store.update({ id: job.id, leaseUntil: new Date(Date.now() + 60_000), expectedLeaseToken, scope: this.scope }).catch(() => undefined); }, 20_000);
     try {
-      const record = await this.addMemoryCore(input, checkpoint);
-      await store.update({ id: job.id, status: "succeeded", checkpoint: "completed", leaseUntil: null, lastError: null, scope: this.scope });
+      const record = await this.addMemoryCore(input ?? this.memoryInputFromJob(job), checkpoint);
+      await store.update({ id: job.id, status: "succeeded", checkpoint: "completed", leaseUntil: null, leaseToken: null, expectedLeaseToken, lastError: null, scope: this.scope });
       return record;
     } catch (error) {
       const failure = error instanceof PlanetError ? error : new PlanetProviderError("memory ingestion", error);
       const retry = job.attempts < job.maxAttempts && !(failure instanceof PlanetValidationError);
-      try { await store.update({ id: job.id, status: retry ? "retry_wait" : "failed", nextAttemptAt: retry ? new Date(Date.now() + Math.min(3_600_000, 1000 * 2 ** job.attempts)) : undefined, leaseUntil: null, lastError: failure.message.slice(0, 2000), scope: this.scope }); } catch { /* Preserve the original error; the lease allows recovery. */ }
-      if (!retry) {
+      let failureRecorded = false;
+      try { await store.update({ id: job.id, status: retry ? "retry_wait" : "failed", nextAttemptAt: retry ? new Date(Date.now() + Math.min(3_600_000, 1000 * 2 ** job.attempts)) : undefined, leaseUntil: null, leaseToken: null, expectedLeaseToken, lastError: failure.message.slice(0, 2000), scope: this.scope }); failureRecorded = true; } catch { /* Preserve the original error; the lease allows recovery. */ }
+      if (failureRecorded && !retry) {
         try {
-          const existing = await this.resolve("memories", "read")?.get(input.id ?? "", this.scope);
-          if (existing) await this.memory.delete(existing.id);
+          const existing = await this.resolve("memories", "read")?.get(input?.id ?? (typeof job.input.memoryId === "string" ? job.input.memoryId : ""), this.scope);
+          if (existing) await this.deleteMemory(existing.id);
         } catch { /* Keep the job terminal and retain the original failure for operator repair. */ }
       }
       Object.assign(failure, { ingestionJobId: job.id });
@@ -562,17 +759,28 @@ export class Planet {
     const memoryId = input.id ?? (input.source ? await stableUuid(`memory:${this.scope.tenantId}:${this.scope.workspaceId ?? ""}:${input.source.type}:${input.source.id}`) : crypto.randomUUID());
     const jobId = await stableUuid(`memory-job:${this.scope.tenantId}:${this.scope.workspaceId ?? ""}:${memoryId}`);
     const payload: JsonObject = { memoryId, agentId: input.agentId, content: input.content, type: input.type ?? "fact", userId: input.userId ?? null, sessionId: input.sessionId ?? null, importance: input.importance ?? null, confidence: input.confidence ?? null, source: (input.source ?? null) as unknown as JsonObject, metadata: (input.metadata ?? {}) as JsonObject };
+    this.validateCustom("ingestionJob", payload);
     let job = await jobs.create({ id: jobId, kind: "memory", input: payload, scope: this.scope });
-    job = await jobs.update({ id: jobId, status: "processing", attempts: 1, leaseUntil: new Date(Date.now() + 60_000), lastError: null, scope: this.scope });
-    return this.executeMemoryJob(job, { ...input, id: memoryId });
+    job = await jobs.claim({ id: jobId, leaseMs: 60_000, scope: this.scope });
+    return this.executeMemoryJob(job);
   }
 
   private async cleanupFailedDocument(documentId: string): Promise<string[]> {
     const failures: string[] = [];
-    let chunks: Awaited<ReturnType<DocumentChunkStore["list"]>> = [];
-    try { chunks = await this.requireChunks("read").list({ documentId, limit: 100000, scope: this.scope }); } catch (error) { failures.push(`chunks lookup: ${error instanceof Error ? error.message : "failed"}`); }
-    if (this.resolve("vector", "write")) for (const chunk of chunks) {
-      try { await this.requireVector("write").delete({ id: chunk.id, namespace: "document-chunk", scope: this.scope }); } catch (error) { failures.push(`vector ${chunk.id}: ${error instanceof Error ? error.message : "failed"}`); }
+    if (this.resolve("vector", "write")) {
+      try {
+        const chunks = this.requireChunks("read");
+        if (!chunks.listPage) throw new PlanetCapabilityError("cursor pagination on DocumentChunkStore for document cleanup");
+        let afterId: string | undefined;
+        while (true) {
+          const page = await chunks.listPage({ documentId, limit: 500, afterId, scope: this.scope });
+          for (const chunk of page.items) {
+            try { await this.requireVector("write").delete({ id: chunk.id, namespace: "document-chunk", scope: this.scope }); } catch (error) { failures.push(`vector ${chunk.id}: ${error instanceof Error ? error.message : "failed"}`); }
+          }
+          if (!page.hasMore || !page.items.length) break;
+          afterId = page.items.at(-1)!.id;
+        }
+      } catch (error) { failures.push(`chunks lookup: ${error instanceof Error ? error.message : "failed"}`); }
     }
     try { await this.resolve("evidence", "write")?.deleteByDocument?.({ documentId, scope: this.scope }); } catch (error) { failures.push(`evidence: ${error instanceof Error ? error.message : "failed"}`); }
     try { await this.resolve("graph", "write")?.deleteNode(documentId, this.scope); } catch (error) { failures.push(`graph node: ${error instanceof Error ? error.message : "failed"}`); }
@@ -580,6 +788,20 @@ export class Planet {
     if (documents?.delete) try { await documents.delete(documentId, this.scope); } catch (error) { failures.push(`document: ${error instanceof Error ? error.message : "failed"}`); }
     else failures.push("document adapter does not support deletion");
     return failures;
+  }
+
+  private async deleteMemory(id: string): Promise<boolean> {
+    const current = await this.requireMemories("read").get(id, this.scope);
+    if (!current) return false;
+    const vector = this.resolve("vector", "write");
+    const graph = this.resolve("graph", "write");
+    const memoryNode = graph ? await graph.getNode(id, this.scope) : null;
+    if (vector) {
+      await vector.delete({ id, namespace: "memory", scope: this.scope });
+      if (memoryNode?.type === "memory") await vector.delete({ id, namespace: this.retrieval.nodeNamespace ?? "node", scope: this.scope });
+    }
+    if (memoryNode?.type === "memory") await graph!.deleteNode(id, this.scope);
+    return this.requireMemories("write").delete(id, this.scope);
   }
 
   private ingestionContext(): KnowledgeIngestionContext {
@@ -639,6 +861,8 @@ export class Planet {
       queryRanker: this.queryRanker,
       searchGraph: (search) => this.searchGraph(search),
       searchMemories: (search) => this.searchMemories(search),
+      resolveGraph: (operation) => this.resolve("graph", operation),
+      resolveEvidence: (operation) => this.resolve("evidence", operation),
       resolveChunks: (operation) => this.resolve("chunks", operation),
       resolveVector: (operation) => this.resolve("vector", operation),
       requireChunks: (operation) => this.requireChunks(operation),

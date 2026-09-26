@@ -28,13 +28,35 @@ The Elysia app reads environment variables at startup:
 
 ## Migrations
 
-For local development, Compose mounts the ordered PostgreSQL SQL migrations into the database initialization directory. For an existing database, configure `DATABASE_URL` and run:
+For local development, Compose initializes PostgreSQL with the ordered SQL files in `packages/postgres/migrations`. In production, the application owns the migration history and release step: add the required Planet storage SQL to the application's migration system and run it with your established PostgreSQL tooling. The package runner is available for local and direct maintenance use:
 
 ```sh
 bun run --cwd packages/postgres migrate
 ```
 
-Set `PLANET_SCHEMA` consistently for the migration command and `createPostgresProvider`. PostgreSQL vector search requires pgvector. MongoDB requires a replica set for transactions; Atlas Vector Search also requires an index configured in Atlas.
+Set `PLANET_SCHEMA` consistently for a single-schema setup, or use `PLANET_SCHEMAS` (comma-separated) with the package runner for multiple schemas. PostgreSQL vector search requires pgvector. Manage MongoDB collections and indexes through your application's MongoDB migrations. MongoDB transactions require a replica set; Atlas Vector Search also requires an index configured in Atlas. Neo4j constraints and indexes belong in application-owned Cypher migrations.
+
+### Upgrade existing scope keys
+
+PostgreSQL and MongoDB now use an unambiguous v2 storage key for `{ tenantId, workspaceId }`. This changes stored scope identifiers. **Stop all Planet writers and make a database backup before deploying the new readers.** Old and new application versions must not write to the same database during this migration.
+
+For each PostgreSQL schema used by Planet, run the migration command. Migration `012` adds ingestion lease tokens and `013` inventories old scope keys in `unknownplanet_scope_key_map`. Migration `014` refuses to rewrite any key containing `:` until its tenant and workspace are specified. Inspect the inventory for each schema:
+
+```sql
+SELECT old_scope_id FROM planet.unknownplanet_scope_key_map WHERE tenant_id IS NULL;
+```
+
+Replace `planet` with your Planet schema. Supply the actual ownership for every listed key, then rerun the migration command:
+
+```sql
+UPDATE planet.unknownplanet_scope_key_map
+SET tenant_id = 'acme', workspace_id = 'team:research'
+WHERE old_scope_id = 'acme:team:research';
+```
+
+The old key alone cannot prove where its tenant ID ends and workspace ID begins. If two different scopes previously produced the same key, their rows are already mixed; inspect and separate those records from a backup before assigning a mapping. Migration `014` is transactional per schema and preserves the old-to-new map for rollback. To roll back after new writes, restore the backup; a simple key reversal cannot assign new records to legacy keys safely.
+
+For MongoDB, call `migrateMongoScopeKeys(database, mappings, schemas)` from `@unknown-planet/mongodb` in a one-off maintenance process before starting the new application version. `mappings` maps each ambiguous old key to its real scope, for example `{ 'acme:team:research': { tenantId: 'acme', workspaceId: 'team:research' } }`. Pass the same `schemas` map used by `createMongoProvider`. The migrator inventories keys before writes, records mappings in `unknownplanet_scope_key_map`, and can resume after a partial failure. MongoDB transactions are required to move vector documents because their `_id` includes the scope key. Keep the backup until the migrated application has been checked.
 
 ## Authentication and isolation
 

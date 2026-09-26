@@ -19,4 +19,4 @@ export interface AddEvidenceInput extends ScopedInput {
   sourceType?: string; extractor: string; confidence?: number; direction?: Evidence["direction"]; strength?: number; metadata?: JsonObject;
 }
 export interface EvidenceListInput extends ScopedInput { edgeId?: EdgeId; edgeIds?: EdgeId[]; documentId?: DocumentId; sourceId?: string; limit?: number }
-export interface EvidenceStore { add(input: AddEvidenceInput): Promise<Evidence>; list(input: EvidenceListInput): Promise<Evidence[]>; deleteByDocument?(input: ScopedInput & { documentId: DocumentId }): Promise<number> }
+export interface EvidenceStore { add(input: AddEvidenceInput): Promise<Evidence>; list(input: EvidenceListInput): Promise<Evidence[]>; listPage?(input: EvidenceListInput & { afterId?: string }): Promise<{ items: Evidence[]; hasMore: boolean }>; deleteByDocument?(input: ScopedInput & { documentId: DocumentId }): Promise<number>; deleteByChunks?(input: ScopedInput & { chunkIds: string[] }): Promise<number> }

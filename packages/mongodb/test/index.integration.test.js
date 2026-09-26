@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { MongoClient } from "mongodb";
-import { MongoDocumentChunkStore, MongoDocumentStore, MongoEvidenceStore, MongoGraphStore, MongoIngestionJobStore, MongoMemoryStore } from "../dist/index.js";
+import { createMongoProvider, MongoDocumentChunkStore, MongoDocumentStore, MongoEvidenceStore, MongoGraphStore, MongoIngestionJobStore, MongoMemoryStore } from "../dist/index.js";
 
 if (process.env.UP_TEST_MONGODB_URI) test("MongoDB persists scoped memory, graph, chunks, and source evidence", async () => {
   const client = new MongoClient(process.env.UP_TEST_MONGODB_URI);
@@ -70,6 +70,29 @@ if (process.env.UP_TEST_MONGODB_URI) test("MongoDB durably schedules and atomica
     const [retry] = await jobs.claimDue({ scope, limit: 10 });
     expect(retry).toMatchObject({ id: "job-1", status: "processing", attempts: 2, checkpoint: "chunks_saved" });
     expect(retry.lastError).toBe("temporary");
+  } finally {
+    await client.db(db.databaseName).dropDatabase();
+    await client.close();
+  }
+});
+
+if (process.env.UP_TEST_MONGODB_URI) test("MongoDB live queue, stack, and key/value operations", async () => {
+  const client = new MongoClient(process.env.UP_TEST_MONGODB_URI);
+  await client.connect();
+  const db = client.db(`unknownplanet_primitives_test_${crypto.randomUUID().replaceAll("-", "")}`);
+  const scope = { tenantId: "tenant-a", workspaceId: "live" };
+  try {
+    const provider = createMongoProvider({ database: db });
+    const sent = await provider.queue.enqueue({ queue: "integration", value: { action: "index" }, scope });
+    const [claimed] = await provider.queue.claim({ queue: "integration", leaseMs: 5000, scope });
+    expect(claimed).toMatchObject({ id: sent.id, value: { action: "index" }, attempts: 1 });
+    expect(await provider.queue.ack({ queue: "integration", id: sent.id, leaseToken: claimed.leaseToken, scope })).toBe(true);
+    await provider.stack.push({ stack: "undo", value: { action: "restore" }, scope });
+    expect(await provider.stack.peek({ stack: "undo", scope })).toEqual({ action: "restore" });
+    expect(await provider.stack.pop({ stack: "undo", scope })).toEqual({ action: "restore" });
+    await provider.keyValue.set({ namespace: "sessions", key: "live-session", value: { userId: "user-1" }, ttlMs: 60_000, scope });
+    expect(await provider.keyValue.get({ namespace: "sessions", key: "live-session", scope })).toMatchObject({ value: { userId: "user-1" }, expiresAt: expect.any(Date) });
+    expect(await provider.keyValue.delete({ namespace: "sessions", key: "live-session", scope })).toBe(true);
   } finally {
     await client.db(db.databaseName).dropDatabase();
     await client.close();

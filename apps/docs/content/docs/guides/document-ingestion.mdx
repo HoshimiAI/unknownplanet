@@ -26,7 +26,7 @@ const result = await planet.document.ingest({
 
 Stable source identity comes from tenant/workspace plus `externalId`, `contentUri`, or content-derived identity. Reingesting the same source updates its deterministic document/chunk records and removes stale chunk vectors/chunks. Choose stable external IDs when source content can change.
 
-When embeddings are configured, chunks are embedded into `document-chunk`. When an entity extractor is configured, Planet creates a document node, entity nodes, `MENTIONS` edges, and evidence. Without an extractor it still parses, chunks, and (if embeddings exist) vector-indexes.
+When embeddings are configured, chunks are embedded into `document-chunk`. When an entity extractor is configured, Planet creates a document node, entity nodes, `MENTIONS` edges, and evidence. Evidence points to each chunk containing the extracted entity name or alias; if none contains an exact name, it falls back to document-level provenance. Reingestion removes evidence linked to chunks that are replaced. Without an extractor it still parses, chunks, and (if embeddings exist) vector-indexes.
 
 ## Chunk sizing
 
@@ -35,6 +35,8 @@ Chunk size and overlap are measured in JavaScript string characters, not tokens.
 ## Durable jobs and retries
 
 When `ingestionJobs` is routed, ingestion records checkpoints, leases work, and can retry transient failures. Call `planet.ingestion.get(jobId)` for status and `planet.ingestion.runDue({ limit, leaseMs })` from a worker. Keep worker polling outside request handling for long-running corpora. Jobs track queued/processing/retry_wait/succeeded/failed states and checkpoints such as `parsed`, `chunks_saved`, `vectors_saved`, and `knowledge_saved`.
+
+Durable inputs up to 256 KiB retain their bytes inline in the job payload for compatibility. Larger inputs require a routed `BlobStorageAdapter`; Planet stores the bytes there and persists only its URI in the job. The blob adapter must remain available to retry workers. Worker claims carry a lease token, so an expired worker cannot mark a reclaimed job complete. Apply PostgreSQL migration `012_ingestion_lease_tokens.sql` before using the new worker code against an existing database.
 
 ## Manage and cite chunks
 

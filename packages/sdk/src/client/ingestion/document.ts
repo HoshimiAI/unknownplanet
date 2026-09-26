@@ -56,6 +56,8 @@ export async function ingestDocumentCore(input: DocumentIngestInput, context: Kn
   });
   await checkpoint?.("vectors_saved");
   const keptChunkIds = new Set(chunks.map((chunk) => chunk.id));
+  const removedChunkIds = previousChunks.filter((previous) => !keptChunkIds.has(previous.id)).map((previous) => previous.id);
+  if (removedChunkIds.length) await context.resolveEvidence("write")?.deleteByChunks?.({ chunkIds: removedChunkIds, scope: context.scope });
   for (const previous of previousChunks) if (!keptChunkIds.has(previous.id) && context.resolveVector("write")) await context.requireVector("write").delete({ id: previous.id, namespace: "document-chunk", scope: context.scope });
   await context.requireChunks("write").deleteExcept({ documentId: id, keepIds: [...keptChunkIds], scope: context.scope });
   await withSpan("planet.ingestion.knowledge", {}, async () => { if (context.entityExtractor) {
@@ -74,8 +76,19 @@ export async function ingestDocumentCore(input: DocumentIngestInput, context: Kn
       let edge = await graph.getEdge(edgeId, context.scope);
       if (!edge) { try { edge = await graph.createEdge({ id: edgeId, from: sourceNode.id, to: node.id, relation: "MENTIONS", confidence: 0.7, status: "candidate", properties: { sourceId: id }, scope: context.scope }); } catch (cause) { edge = await graph.getEdge(edgeId, context.scope); if (!edge) throw new PlanetProviderError(`document graph linking for '${entity.name}'`, cause); } }
       if (context.resolveEvidence("write")) {
-        const prior = await context.requireEvidence("read").list({ edgeId, documentId: id, limit: 1, scope: context.scope });
-        if (!prior.length) await context.requireEvidence("write").add({ id: await stableUuid(`document-evidence:${edgeId}`), edgeId, documentId: id, sourceType: "document", extractor: "entity-extractor", confidence: 0.7, metadata: { entity: entity.name }, scope: context.scope });
+        const prior = await context.requireEvidence("read").list({ edgeId, documentId: id, limit: 100000, scope: context.scope });
+        const names = [entity.name, ...entity.aliases].map((name) => name.trim().toLocaleLowerCase()).filter(Boolean);
+        const supportingChunks = chunks.filter((chunk) => names.some((name) => chunk.text?.toLocaleLowerCase().includes(name)));
+        const sources = supportingChunks.length ? supportingChunks.map((chunk) => ({ chunkId: chunk.id })) : [{ chunkId: undefined }];
+        for (const source of sources) {
+          if (prior.some((item) => item.chunkId === source.chunkId)) continue;
+          const evidenceId = await stableUuid(`document-evidence:${edgeId}:${source.chunkId ?? "document"}`);
+          try {
+            await context.requireEvidence("write").add({ id: evidenceId, edgeId, documentId: id, chunkId: source.chunkId, sourceType: "document", extractor: "entity-extractor", confidence: 0.7, metadata: { entity: entity.name }, scope: context.scope });
+          } catch (cause) {
+            if (!(await context.requireEvidence("read").list({ edgeId, documentId: id, limit: 100000, scope: context.scope })).some((item) => item.id === evidenceId)) throw new PlanetProviderError(`document evidence attachment for '${entity.name}'`, cause);
+          }
+        }
       }
     }
     for (const stale of await graph.neighbors({ nodeId: sourceNode.id, direction: "outbound", relation: "MENTIONS", scope: context.scope, limit: 1000 })) if (!desiredIds.has(stale.targetId)) await graph.deleteEdge(stale.id, context.scope);
