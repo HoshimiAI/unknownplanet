@@ -4,6 +4,12 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish packages to npm
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -42,7 +48,7 @@ jobs:
         run: bun run build
 
       - name: Publish packages
-        if: github.event_name == 'release'
+        if: github.event_name == 'release' || inputs.publish
         run: |
           set -euo pipefail
 
@@ -63,4 +69,4 @@ jobs:
             (cd "$directory" && bun publish --access public)
           done
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
