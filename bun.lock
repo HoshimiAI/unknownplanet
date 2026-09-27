@@ -52,11 +52,11 @@
     },
     "packages/core": {
       "name": "@unknown-planet/core",
-      "version": "1.0.0",
+      "version": "1.1.0",
     },
     "packages/minio": {
       "name": "@unknown-planet/minio",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "dependencies": {
         "@aws-sdk/client-s3": "^3.850.0",
         "@unknown-planet/core": "workspace:*",
@@ -64,7 +64,7 @@
     },
     "packages/mongodb": {
       "name": "@unknown-planet/mongodb",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "dependencies": {
         "@unknown-planet/core": "workspace:*",
         "mongodb": "^6.18.0",
@@ -72,7 +72,7 @@
     },
     "packages/neo4j": {
       "name": "@unknown-planet/neo4j",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "dependencies": {
         "@unknown-planet/core": "workspace:*",
       },
@@ -88,7 +88,7 @@
     },
     "packages/postgres": {
       "name": "@unknown-planet/postgres",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "dependencies": {
         "@opentelemetry/api": "^1.9.1",
         "@unknown-planet/core": "workspace:*",
@@ -100,7 +100,7 @@
     },
     "packages/qdrant": {
       "name": "@unknown-planet/qdrant",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "dependencies": {
         "@unknown-planet/core": "workspace:*",
       },
@@ -116,7 +116,7 @@
     },
     "packages/redis": {
       "name": "@unknown-planet/redis",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "dependencies": {
         "@unknown-planet/core": "workspace:*",
       },
@@ -132,7 +132,7 @@
     },
     "packages/sdk": {
       "name": "@unknown-planet/sdk",
-      "version": "1.0.0",
+      "version": "1.1.0",
       "dependencies": {
         "@opentelemetry/api": "^1.9.1",
         "@unknown-planet/core": "workspace:*",
@@ -140,7 +140,7 @@
     },
     "packages/sqlite": {
       "name": "@unknown-planet/sqlite",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "dependencies": {
         "@unknown-planet/core": "workspace:*",
       },
