@@ -10,6 +10,7 @@ export { startHttpRequest } from "./observability/telemetry.js";
 export type {
   CustomDataKind, CustomSchemaKey, CustomSchemas, DocumentIngestInput, DocumentIngestResult, EntityResolutionConfig, GraphSearchInput, GraphSearchResult, PlanetHook, PlanetHookEvent,
   FeaturePolicy, FeaturePolicyInput, PlanetConfig, PlanetQueryInput, PlanetQueryResult, PlanetQueryRanker, ProviderSelectionInput, ProviderSelector, RetrievalConfig,
+  PlanetQuerySource,
 } from "./types.js";
 
 export type {

@@ -386,11 +386,33 @@ const cache = planet.extension(cacheExtension)
 
 ## Lunar ADK custom provider
 
-Lunar ADK integrates through a Lunar-owned custom provider package. The provider consumes a configured `Planet` instance and currently implements Lunar's `StorageBundle` contract using PostgreSQL SQL transactions.
+Lunar ADK owns agent execution and runtime context; Unknown Planet owns source ingestion, scoped retrieval, provider routing, and attribution. Lunar's `@lunar-adk/storage-unknown-planet` package consumes a caller-configured Planet client. Its context adapter uses `planet.query()` and does not create database clients, install database drivers, or run Planet migrations. Configure the query's graph, document, vector, and evidence capabilities in the application as needed.
 
-The integration requires a PostgreSQL-routed `planet.sql` capability because Lunar run/session persistence relies on atomic transactions. It stores Lunar runs, sessions, and workflows in a dedicated `lunar` schema; source graph/document data stays in the existing Planet domains. Lunar memory integration is the next package milestone.
+Enable source-grounded knowledge context per agent and register the configured provider on its runtime:
 
-The provider's additive migration and its rollback guidance are documented in [Lunar ADK provider notes](docs/lunar-adk-provider.md). Cache and artifacts remain Lunar-owned future providers: a Lunar cache provider can consume a typed Planet extension without either core framework changing.
+```ts
+import { createRuntime, defineAgent } from "@lunar-adk/adk"
+import { createUnknownPlanetContextProvider } from "@lunar-adk/storage-unknown-planet"
+
+const scope = { tenantId: "acme", workspaceId: "research" }
+const context = createUnknownPlanetContextProvider({ planet, scope })
+const runtime = await createRuntime({ context })
+runtime.registerAgent(defineAgent({
+  name: "researcher",
+  model,
+  context: { providerId: context.id, retrieveLimit: 6 },
+}))
+
+const result = await runtime.run("researcher", "What supports this claim?", {
+  tenantId: scope.tenantId,
+  workspaceId: scope.workspaceId,
+})
+// result.run.events includes context.retrieved with stable source labels and citations.
+```
+
+Retrieved knowledge is marked as untrusted model context. Retrieval runs once for a new turn; retries reuse the same context, while continuations keep the original source labels and references. The adapter checks the runtime tenant against its explicit Planet scope and fails closed on mismatch. Planet query source references preserve their existing identifiers and add document title, content URI, and chunk offsets when available.
+
+Lunar run/session/workflow persistence is a separate optional integration: it requires the Planet SQL capability and its own Lunar storage migration. Knowledge retrieval alone needs no `planet.sql` capability or Lunar storage migration. See Lunar's [Unknown Planet use case](https://github.com/HoshimiAI/lunar-adk/blob/main/apps/docs/content/docs/use-cases/unknown-planet.mdx) for the storage and context integration details.
 
 ## Customization
 

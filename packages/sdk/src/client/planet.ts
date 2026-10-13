@@ -864,6 +864,7 @@ export class Planet {
       resolveGraph: (operation) => this.resolve("graph", operation),
       resolveEvidence: (operation) => this.resolve("evidence", operation),
       resolveChunks: (operation) => this.resolve("chunks", operation),
+      resolveDocuments: (operation) => this.resolve("documents", operation),
       resolveVector: (operation) => this.resolve("vector", operation),
       requireChunks: (operation) => this.requireChunks(operation),
       requireVector: (operation) => this.requireVector(operation),

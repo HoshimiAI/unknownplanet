@@ -135,7 +135,19 @@ export interface PlanetQueryInput {
 }
 
 export interface PlanetQueryResult extends GraphSearchResult {
-  sources: Array<{ type?: string; id?: string; documentId?: string; chunkId?: string }>;
+  sources: PlanetQuerySource[];
+}
+
+/** A source attached to a query result. Existing identifiers remain stable; descriptive fields are added when stores provide them. */
+export interface PlanetQuerySource {
+  type?: string;
+  id?: string;
+  documentId?: string;
+  chunkId?: string;
+  title?: string;
+  contentUri?: string;
+  startOffset?: number;
+  endOffset?: number;
 }
 
 export interface DocumentIngestInput {

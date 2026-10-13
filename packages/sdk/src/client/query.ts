@@ -1,4 +1,4 @@
-import type { DocumentChunkStore, EmbeddingProvider, EvidenceStore, GraphNode, GraphStore, MemoryRecord, MemorySearchInput, PlanetScope, ProviderOperation, VectorStore } from "@unknown-planet/core";
+import type { DocumentChunkStore, DocumentStore, EmbeddingProvider, EvidenceStore, GraphNode, GraphStore, MemoryRecord, MemorySearchInput, PlanetScope, ProviderOperation, VectorStore } from "@unknown-planet/core";
 import { PlanetCapabilityError, PlanetValidationError } from "../errors.js";
 import type { GraphSearchInput, GraphSearchResult, PlanetQueryInput, PlanetQueryResult, PlanetQueryRanker } from "../types.js";
 
@@ -11,6 +11,7 @@ export interface QueryContext {
   resolveGraph(operation: ProviderOperation): GraphStore | undefined;
   resolveEvidence(operation: ProviderOperation): EvidenceStore | undefined;
   resolveChunks(operation: ProviderOperation): DocumentChunkStore | undefined;
+  resolveDocuments(operation: ProviderOperation): DocumentStore | undefined;
   resolveVector(operation: ProviderOperation): VectorStore | undefined;
   requireChunks(operation: ProviderOperation): DocumentChunkStore;
   requireVector(operation: ProviderOperation): VectorStore;
@@ -87,5 +88,33 @@ export async function queryKnowledge(input: PlanetQueryInput, context: QueryCont
     });
   }
   if (input.includeEvidence === false) for (const result of results) result.evidence = [];
+  // Source detail hydration is optional; unavailable routes must not invalidate query results.
+  let documents: DocumentStore | undefined;
+  let chunks: DocumentChunkStore | undefined;
+  try { documents = context.resolveDocuments("read"); } catch { /* Keep source identifiers without document details. */ }
+  try { chunks = context.resolveChunks("read"); } catch { /* Keep source identifiers without chunk details. */ }
+  const documentCache = new Map<string, ReturnType<DocumentStore["get"]>>();
+  const chunkCache = new Map<string, ReturnType<DocumentChunkStore["get"]>>();
+  results = await Promise.all(results.map(async (result) => {
+    const sources = await Promise.all(result.sources.map(async (source) => {
+      const documentId = source.documentId;
+      const chunkId = source.chunkId;
+      const documentPromise = documentId && documents
+        ? (documentCache.get(documentId) ?? (() => { const promise = documents.get(documentId, context.scope).catch(() => null); documentCache.set(documentId, promise); return promise; })())
+        : undefined;
+      const chunkPromise = chunkId && chunks
+        ? (chunkCache.get(chunkId) ?? (() => { const promise = chunks.get(chunkId, context.scope).catch(() => null); chunkCache.set(chunkId, promise); return promise; })())
+        : undefined;
+      const [document, chunk] = await Promise.all([documentPromise, chunkPromise]);
+      return {
+        ...source,
+        ...(document ? { title: document.title, contentUri: document.contentUri } : {}),
+        ...(chunk?.contentUri ? { contentUri: chunk.contentUri } : {}),
+        ...(chunk?.startOffset !== undefined ? { startOffset: chunk.startOffset } : {}),
+        ...(chunk?.endOffset !== undefined ? { endOffset: chunk.endOffset } : {}),
+      };
+    }));
+    return { ...result, sources };
+  }));
   return results;
 }
